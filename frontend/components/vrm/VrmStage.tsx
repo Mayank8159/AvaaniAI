@@ -2,119 +2,104 @@
 
 import React, { useEffect, useRef } from "react";
 import * as THREE from "three";
-import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { loadVrm } from "@/lib/vrm/loadVrm";
 import { createRenderer } from "@/lib/three/createRenderer";
-import { createScene, createCamera } from "@/lib/three/createScene";
+import { createScene } from "@/lib/three/createScene";
 import { disposeObject3D } from "@/lib/vrm/disposeThree";
 
-// --- IMPORT CONTROLLERS ---
-import { RootFixer } from "@/features/body/RootFixer";
-import { IdleHumanController } from "@/features/emotions/IdleHumanController";
-import { SecondaryPhysicsController } from "@/features/physics/SecondaryPhysicsController";
-import { DanceController } from "@/features/dances/DanceController";
 import { BodyController } from "@/features/body/BodyController";
 import { PhysicsController } from "@/features/physics/PhysicsController";
-import { PoseController } from "@/features/body/PoseController"; // New
+import { PoseController } from "@/features/body/PoseController"; 
 import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
 export default function VrmStage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const controlsRef = useRef<OrbitControls | null>(null);
 
   useEffect(() => {
     let mounted = true;
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || rendererRef.current) return;
 
-    // 1. Init Renderer (Singleton)
-    if (rendererRef.current) return;
+    // 1. Setup Core
     const renderer = createRenderer(canvas);
+    renderer.shadowMap.enabled = true; // Enable shadows in renderer
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     rendererRef.current = renderer;
 
     const scene = createScene();
+    const clock = new THREE.Clock();
 
-    // 2. Init Camera (Positioned for full body)
+    // 2. Add Floor Shadow Plane
+    const floorGeometry = new THREE.PlaneGeometry(10, 10);
+    const floorMaterial = new THREE.ShadowMaterial({ opacity: 0.2 }); // Only shows shadows
+    const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
     const camera = new THREE.PerspectiveCamera(30.0, window.innerWidth / window.innerHeight, 0.1, 20.0);
     camera.position.set(0.0, 1.4, 3.5);
 
-    // 3. Init Controls
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0.0, 0.9, 0.0); // Look at center mass
+    controls.target.set(0.0, 1.1, 0.0);
     controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
-    controlsRef.current = controls;
 
-    const clock = new THREE.Clock();
-
-    // 4. Controller Refs
-    let rootFixer: RootFixer | null = null;
-    let idleHuman: IdleHumanController | null = null;
-    let secondaryPhysics: SecondaryPhysicsController | null = null;
-    let dance: DanceController | null = null;
     let vrm: any = null;
+    const controllers: any = { body: null, physics: null, pose: null };
 
-    // 5. Resize Logic
     const onResize = () => {
       if (canvas.parentElement) {
         camera.aspect = canvas.parentElement.clientWidth / canvas.parentElement.clientHeight;
         camera.updateProjectionMatrix();
         renderer.setSize(canvas.parentElement.clientWidth, canvas.parentElement.clientHeight);
+        if (vrm?.scene) fitVrmToView(vrm.scene, camera, { targetHeight: 1.7, padding: 0.8 });
       }
     };
-    window.addEventListener("resize", onResize);
-    onResize();
 
-    // 6. Load VRM
+    window.addEventListener("resize", onResize);
+
     (async () => {
       try {
         vrm = await loadVrm("/models/character.vrm");
         if (!mounted) return;
 
+        // Enable shadows for the character
+        vrm.scene.traverse((obj: any) => {
+          if (obj.isMesh) {
+            obj.castShadow = true;
+            obj.receiveShadow = true;
+          }
+        });
+
         scene.add(vrm.scene);
 
-        // ✅ CRITICAL: Force an initial update to fix "squeezed" mesh
-        vrm.update(0);
-
-        // Initialize Controllers
-        controllers.emotion = new EmotionController(vrm);
-        controllers.attrs = new AttributeController(vrm);
-        controllers.dance = new DanceController(vrm);
         controllers.body = new BodyController(vrm);
+        controllers.physics = new PhysicsController(vrm);
+        controllers.pose = new PoseController(vrm); 
         
-        // This now has the safety check fix
-        controllers.physics = new PhysicsController(vrm); 
-        
-        // This rotates the arms down from the T-pose
-        controllers.pose = new PoseController(vrm);
-
-        controllers.emotion.setEmotion("neutral");
-        
+        controllers.body.setBodyWeight(0.2); 
+        vrm.update(0); 
         onResize();
       } catch (e) {
-        console.error("Failed to load VRM:", e);
+        console.error("VRM Stage Error:", e);
       }
     })();
 
-    // 7. Render Loop
     const animate = () => {
       rafRef.current = requestAnimationFrame(animate);
       const dt = clock.getDelta();
+      const t = clock.getElapsedTime();
 
       controls.update();
 
       if (vrm) {
-        // Essential: Standard VRM physics and bone update
+        controllers.body?.update?.(dt);
+        controllers.pose?.update?.(dt);
+        controllers.physics?.applyWind?.(t);
         vrm.update(dt);
-
-        const blink = Math.sin(t * 0.5) > 0.98 ? 1 : 0;
-        controllers.emotion?.blink(blink);
-        controllers.emotion?.update(dt);
-        controllers.attrs?.breathe(t);
-        controllers.dance?.update(dt);
-        controllers.body?.update(dt);
       }
 
       renderer.render(scene, camera);
@@ -122,7 +107,6 @@ export default function VrmStage() {
 
     animate();
 
-    // 8. Cleanup
     return () => {
       mounted = false;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -138,11 +122,8 @@ export default function VrmStage() {
   }, []);
 
   return (
-    <div style={{ width: "100vw", height: "100vh", background: "#121212", touchAction: "none" }}>
-      <canvas 
-        ref={canvasRef} 
-        style={{ width: "100%", height: "100%", display: "block", cursor: "grab" }} 
-      />
+    <div style={{ width: "100vw", height: "100vh", touchAction: "none" }}>
+      <canvas ref={canvasRef} style={{ width: "100%", height: "100%", cursor: "grab" }} />
     </div>
   );
 }
