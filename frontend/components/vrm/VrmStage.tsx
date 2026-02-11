@@ -53,7 +53,7 @@ export default function VrmScene() {
     controls.enableDamping = true;
     controls.target.set(0, 1.1, 0);
 
-<<<<<<< Updated upstream
+
     // ✅ Wrapper for the avatar (rotate this, not vrm.scene)
     const avatarRoot = new THREE.Group();
     scene.add(avatarRoot);
@@ -66,10 +66,10 @@ export default function VrmScene() {
       pose: PoseController | null;
       idle: IdleBodyController | null;
     } = { body: null, physics: null, pose: null, idle: null };
-=======
+
     let vrm: { scene: THREE.Scene; springBoneManager?: { reset: () => void }; update: (dt: number) => void } | null = null;
     const controllers: { body: BodyController | null; physics: PhysicsController | null; pose: PoseController | null } = { body: null, physics: null, pose: null };
->>>>>>> Stashed changes
+
 
     const onResize = () => {
       if (!canvas.parentElement) return;
@@ -124,18 +124,18 @@ export default function VrmScene() {
         vrm = await loadVrm("/models/character.vrm");
         if (!mounted) return;
 
-<<<<<<< Updated upstream
+
         // Shadows for meshes
         vrm.scene.traverse((obj: any) => {
           if (obj.isMesh) {
             obj.castShadow = true;
             obj.receiveShadow = true;
-=======
+
         vrm.scene.traverse((obj: THREE.Object3D) => {
           if ((obj as THREE.Mesh).isMesh) {
             (obj as THREE.Mesh).castShadow = true;
             (obj as THREE.Mesh).receiveShadow = true;
->>>>>>> Stashed changes
+
           }
         });
 
