@@ -10,10 +10,11 @@ import { disposeObject3D } from "@/lib/vrm/disposeThree";
 
 import { BodyController } from "@/features/body/BodyController";
 import { PhysicsController } from "@/features/physics/PhysicsController";
-import { PoseController } from "@/features/body/PoseController"; // Import added
+import { PoseController } from "@/features/body/PoseController";
+import { IdleBodyController } from "@/features/body/IdleBodyController";
 import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
-export default function VrmStage() {
+export default function VrmScene() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -23,16 +24,18 @@ export default function VrmStage() {
     const canvas = canvasRef.current;
     if (!canvas || rendererRef.current) return;
 
+    // Renderer
     const renderer = createRenderer(canvas);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     rendererRef.current = renderer;
 
+    // Scene + clock
     const scene = createScene();
     const clock = new THREE.Clock();
 
-    // Floor setup for the "Stage" feel
+    // Stage floor
     const floor = new THREE.Mesh(
       new THREE.PlaneGeometry(100, 100),
       new THREE.ShadowMaterial({ opacity: 0.2 })
@@ -41,30 +44,82 @@ export default function VrmStage() {
     floor.receiveShadow = true;
     scene.add(floor);
 
-    const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 20);
+    // Camera
+    const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 20);
     camera.position.set(0, 1.4, 3.5);
 
+    // Controls
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
     controls.target.set(0, 1.1, 0);
 
+    // ✅ Wrapper for the avatar (rotate this, not vrm.scene)
+    const avatarRoot = new THREE.Group();
+    scene.add(avatarRoot);
+
     let vrm: any = null;
-    let controllers: any = { body: null, physics: null, pose: null };
+
+    const controllers: {
+      body: BodyController | null;
+      physics: PhysicsController | null;
+      pose: PoseController | null;
+      idle: IdleBodyController | null;
+    } = { body: null, physics: null, pose: null, idle: null };
 
     const onResize = () => {
-      if (canvas.parentElement) {
-        camera.aspect = canvas.parentElement.clientWidth / canvas.parentElement.clientHeight;
-        camera.updateProjectionMatrix();
-        renderer.setSize(canvas.parentElement.clientWidth, canvas.parentElement.clientHeight);
-      }
+      if (!canvas.parentElement) return;
+      const w = canvas.parentElement.clientWidth;
+      const h = canvas.parentElement.clientHeight;
+
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h, false);
     };
     window.addEventListener("resize", onResize);
+
+    // ✅ Robust facing fix: try ±Z then ±X and pick best
+    const faceAvatarToCamera = () => {
+      if (!vrm) return;
+
+      const humanoid = vrm.humanoid;
+      const hips =
+        humanoid?.getNormalizedBoneNode?.("hips") ||
+        humanoid?.getRawBoneNode?.("hips");
+
+      const basisObj: THREE.Object3D = hips || vrm.scene;
+
+      const avatarPos = new THREE.Vector3();
+      const camPos = new THREE.Vector3();
+      basisObj.getWorldPosition(avatarPos);
+      camera.getWorldPosition(camPos);
+
+      const toCam = camPos.sub(avatarPos).normalize();
+
+      const q = new THREE.Quaternion();
+      basisObj.getWorldQuaternion(q);
+
+      const plusZ = new THREE.Vector3(0, 0, 1).applyQuaternion(q).normalize();
+      const minusZ = new THREE.Vector3(0, 0, -1).applyQuaternion(q).normalize();
+      const plusX = new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize();
+      const minusX = new THREE.Vector3(-1, 0, 0).applyQuaternion(q).normalize();
+
+      const candidates: Array<{ yaw: number; score: number }> = [
+        { yaw: 0, score: plusZ.dot(toCam) }, // front is +Z
+        { yaw: Math.PI, score: minusZ.dot(toCam) }, // front is -Z
+        { yaw: -Math.PI / 2, score: plusX.dot(toCam) }, // front is +X
+        { yaw: Math.PI / 2, score: minusX.dot(toCam) }, // front is -X
+      ];
+
+      candidates.sort((a, b) => b.score - a.score);
+      avatarRoot.rotation.y = candidates[0]?.yaw ?? 0;
+    };
 
     (async () => {
       try {
         vrm = await loadVrm("/models/character.vrm");
         if (!mounted) return;
 
+        // Shadows for meshes
         vrm.scene.traverse((obj: any) => {
           if (obj.isMesh) {
             obj.castShadow = true;
@@ -72,52 +127,85 @@ export default function VrmStage() {
           }
         });
 
-        scene.add(vrm.scene);
+        // Add VRM under wrapper
+        avatarRoot.add(vrm.scene);
 
-        // Initialize all logic
+        // Controllers
+        controllers.pose = new PoseController(vrm);
         controllers.body = new BodyController(vrm);
         controllers.physics = new PhysicsController(vrm);
-        controllers.pose = new PoseController(vrm);
-        
-        // Reset physics engine to "wake up" the hair
+
+        // Subtle "alive" motion layer
+        controllers.idle = new IdleBodyController(vrm, {
+          intensity: 0.9,
+          breathe: 1.0,
+          sway: 1.0,
+          head: 0.9,
+          slerp: 0.22,
+        });
+
+        // Wake springs
         if (vrm.springBoneManager) vrm.springBoneManager.reset();
 
-        controllers.body.setBodyWeight(0.2); 
-        
+        // Your existing setting
+        controllers.body.setBodyWeight(0.2);
+
+        // Settle once
         vrm.update(0);
+
         onResize();
-        if (vrm.scene) fitVrmToView(vrm.scene, camera, { padding: 0.9 });
-      } catch (e) { console.error(e); }
+
+        // Fit camera to the wrapper
+        fitVrmToView(avatarRoot, camera, { padding: 0.9 });
+
+        // Face camera AFTER fitting
+        faceAvatarToCamera();
+
+        // Keep orbit stable
+        controls.target.set(0, 1.1, 0);
+        controls.update();
+      } catch (e) {
+        console.error(e);
+      }
     })();
 
     const animate = () => {
       if (!mounted) return;
       rafRef.current = requestAnimationFrame(animate);
+
       const dt = clock.getDelta();
       const t = clock.getElapsedTime();
 
       if (vrm) {
-        // 1. Maintain the Pose and Body Weight (Hand position fix)
+        // Keep pose/body constraints first
         controllers.pose?.update?.(dt);
         controllers.body?.update?.(dt);
-        
-        // 2. Apply Wind (Physics movement fix)
+
+        // Add subtle idle motion
+        controllers.idle?.update?.(dt);
+
+        // Physics wind
         controllers.physics?.applyWind?.(t);
 
-        // 3. Final VRM solver
+        // Final VRM solver
         vrm.update(dt);
       }
 
       controls.update();
       renderer.render(scene, camera);
     };
+
     animate();
 
     return () => {
       mounted = false;
+
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener("resize", onResize);
+
       if (vrm) disposeObject3D(vrm.scene);
+
+      controls.dispose();
       renderer.dispose();
       rendererRef.current = null;
     };
