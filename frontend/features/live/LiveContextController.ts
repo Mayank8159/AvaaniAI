@@ -61,6 +61,21 @@ export class LiveContextController {
     return this.s.energy;
   }
 
+  /** Use this to drive face saccade suppression */
+  public getGazeScore() {
+    return this.s.gaze; // 0..1 (smoothed)
+  }
+
+  /** Whether tracking is currently visible */
+  public getTrackingVisible() {
+    return !!this.ctx?.tracking?.visible;
+  }
+
+  /** Optional: expose smoothed look values (-1..1) */
+  public getLook() {
+    return { x: this.s.lookX, y: this.s.lookY };
+  }
+
   public update(dt: number) {
     if (!this.ctx) return;
 
@@ -74,9 +89,11 @@ export class LiveContextController {
     const tgtHappy = clamp01(probs.happy ?? 0);
     const tgtSad = clamp01(probs.sad ?? 0);
     const tgtAngry = clamp01(probs.angry ?? 0);
-    const tgtSurprised = clamp01((probs.surprise ?? probs.surprised ?? 0) as number);
+    const tgtSurprised = clamp01(
+      (probs.surprise ?? probs.surprised ?? 0) as number
+    );
 
-    // gate expressions by confidence (your sample had 0.17, so this matters)
+    // gate expressions by confidence
     const gate = clamp(this.s.confidence * 1.6, 0, 1);
 
     this.s.happy += (tgtHappy * gate - this.s.happy) * a;
@@ -95,11 +112,12 @@ export class LiveContextController {
     const visible = !!tr?.visible;
 
     const tx = visible ? ((tr?.x ?? 0.5) - 0.5) * 2 : 0;
-    const ty = visible ? (0.5 - ((tr?.y ?? 0.5) as number)) * 2 : 0;
+    const ty = visible ? (0.5 - (tr?.y ?? 0.5)) * 2 : 0;
 
     const tgtLookX = clamp(tx, -1, 1);
     const tgtLookY = clamp(ty, -1, 1);
 
+    // If not visible, smoothly return to center (0,0)
     this.s.lookX += (tgtLookX - this.s.lookX) * a;
     this.s.lookY += (tgtLookY - this.s.lookY) * a;
 
@@ -109,6 +127,7 @@ export class LiveContextController {
     // Apply expressions
     const em: any = (this.vrm as any).expressionManager;
     if (em?.setValue) {
+      // Note: names depend on avatar; these are common VRM 1.0 presets
       em.setValue("happy", this.s.happy);
       em.setValue("sad", this.s.sad);
       em.setValue("angry", this.s.angry);
@@ -123,7 +142,7 @@ export class LiveContextController {
     const head = humanoid.getNormalizedBoneNode("head");
     const spine = humanoid.getNormalizedBoneNode("spine");
 
-    const yaw = this.s.lookX * 0.35 * this.s.gaze;   // left-right
+    const yaw = this.s.lookX * 0.35 * this.s.gaze; // left-right
     const pitch = this.s.lookY * 0.25 * this.s.gaze; // up-down
 
     if (neck) neck.rotation.set(pitch * 0.4, yaw * 0.4, 0);

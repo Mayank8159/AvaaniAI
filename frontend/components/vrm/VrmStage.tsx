@@ -14,6 +14,7 @@ import { BodyController } from "@/features/body/BodyController";
 import { PhysicsController } from "@/features/physics/PhysicsController";
 import { PoseController } from "@/features/body/PoseController";
 import { IdleBodyController } from "@/features/body/IdleBodyController";
+import { IdleFaceController } from "@/features/body/FaceController";
 import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
 import {
@@ -71,8 +72,9 @@ export default function VrmStage() {
       physics: PhysicsController | null;
       pose: PoseController | null;
       idle: IdleBodyController | null;
+      face: IdleFaceController | null;
       live: LiveContextController | null;
-    } = { body: null, physics: null, pose: null, idle: null, live: null };
+    } = { body: null, physics: null, pose: null, idle: null, face: null, live: null };
 
     const onResize = () => {
       if (!canvas.parentElement) return;
@@ -129,7 +131,7 @@ export default function VrmStage() {
     let pollTimer: number | null = null;
 
     const handleIncoming = (raw: unknown) => {
-      // sometimes backend wraps: {type, payload}, sometimes sends direct JSON
+      // Sometimes backend wraps: {type, payload}, sometimes sends direct JSON
       const msg = raw as any;
       const ctx: AvaaniLiveContext = msg?.payload ?? msg;
 
@@ -152,7 +154,7 @@ export default function VrmStage() {
         };
 
         ws.onclose = () => {
-          // Optional: attempt reconnect (simple backoff)
+          // Attempt reconnect
           if (!mounted) return;
           setTimeout(() => {
             if (mounted) startWebSocket();
@@ -181,7 +183,7 @@ export default function VrmStage() {
       };
 
       poll(); // immediate
-      pollTimer = window.setInterval(poll, 200); // 5Hz is enough for smooth avatar
+      pollTimer = window.setInterval(poll, 200); // ~5Hz
     };
 
     (async () => {
@@ -205,6 +207,7 @@ export default function VrmStage() {
         controllers.pose = new PoseController(vrm);
         controllers.body = new BodyController(vrm);
         controllers.physics = new PhysicsController(vrm);
+
         controllers.idle = new IdleBodyController(vrm, {
           intensity: 0.9,
           breathe: 1.0,
@@ -213,8 +216,8 @@ export default function VrmStage() {
           slerp: 0.22,
         });
 
-        // ✅ Live context controller (expressions + head look)
         controllers.live = new LiveContextController(vrm);
+        controllers.face = new IdleFaceController(vrm);
 
         // Wake springs (depends on your three-vrm version)
         if ((vrm as any).springBoneManager?.reset) (vrm as any).springBoneManager.reset();
@@ -246,19 +249,25 @@ export default function VrmStage() {
       const t = clock.getElapsedTime();
 
       if (vrm) {
-        // Your existing logic order
         controllers.pose?.update?.(dt);
         controllers.body?.update?.(dt);
 
-        // ✅ Apply live context (expressions + head)
+        // Live context drives expressions + head look
         controllers.live?.update(dt);
 
-        // ✅ Drive idle intensity by live energy
+        // Face idle (blink + micro-saccades) but suppress when live tracking is active
+        const gazeScore = controllers.live?.getGazeScore?.() ?? 0;
+        const visible = controllers.live?.getTrackingVisible?.() ?? false;
+        controllers.face?.setLiveGaze({ strength: gazeScore, visible });
+        controllers.face?.update(dt);
+
+        // Drive idle intensity by live energy
         const energy = controllers.live?.getEnergy?.() ?? 0.9;
         controllers.idle?.setConfig?.({ intensity: 0.5 + energy * 0.7 });
         controllers.idle?.update?.(dt);
 
         controllers.physics?.applyWind?.(t);
+
         vrm.update(dt);
       }
 
