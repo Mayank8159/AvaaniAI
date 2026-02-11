@@ -11,7 +11,8 @@ import { disposeObject3D } from "@/lib/vrm/disposeThree";
 import { EmotionController } from "@/features/emotions/EmotionController";
 import { AttributeController } from "@/features/attributes/AttributeController";
 import { DanceController } from "@/features/dances/DanceController";
-import { BodyController } from "@/features/body/BodyController"; // ✅ ADD THIS
+import { BodyController } from "@/features/body/BodyController";
+import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
 export default function VrmStage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -30,13 +31,25 @@ export default function VrmStage() {
     let emotion: EmotionController | null = null;
     let attrs: AttributeController | null = null;
     let dance: DanceController | null = null;
-    let body: BodyController | null = null; // ✅ DEFINE OUTSIDE so animate() can see it
+    let body: BodyController | null = null;
 
     let vrm: any = null;
 
     const clock = new THREE.Clock();
 
-    const onResize = () => resizeToParent(renderer, camera, canvas);
+    const onResize = () => {
+      resizeToParent(renderer, camera, canvas);
+
+      if (vrm?.scene) {
+        fitVrmToView(vrm.scene, camera, {
+          targetHeight: 1.6,
+          padding: 1.2,
+          lookAtY: 1.35,
+          ground: true,
+        });
+      }
+    };
+
     onResize();
     window.addEventListener("resize", onResize);
 
@@ -47,16 +60,24 @@ export default function VrmStage() {
 
         scene.add(vrm.scene);
 
+        // ✅ Fit model + camera for current screen size
+        fitVrmToView(vrm.scene, camera, {
+          targetHeight: 1.6,
+          padding: 1.2,
+          lookAtY: 1.35,
+          ground: true,
+        });
+
         emotion = new EmotionController(vrm);
         attrs = new AttributeController(vrm);
         dance = new DanceController(vrm);
         body = new BodyController(vrm);
 
-        // ✅ Pick ONE default emotion
         emotion.setEmotion("neutral");
-
-        // ✅ Default body weight (0 = slim, 1 = heavy)
         body.setBodyWeight(0.3);
+
+        // Re-run resize once VRM is ready (for correct aspect/camera)
+        onResize();
 
         console.log("VRM ready ✅");
       } catch (e) {
@@ -77,16 +98,16 @@ export default function VrmStage() {
         const blink = Math.sin(t * 0.5) > 0.98 ? 1 : 0;
         emotion?.blink(blink);
 
-        // emotions blend
+        // emotion blending
         emotion?.update(dt);
 
-        // breathing etc
+        // breathing/attributes
         attrs?.breathe(t);
 
-        // dance clips
+        // animations
         dance?.update(dt);
 
-        // ✅ body weight update
+        // body weight blend
         body?.update(dt);
       }
 
@@ -101,7 +122,7 @@ export default function VrmStage() {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener("resize", onResize);
 
-      if (vrm) {
+      if (vrm?.scene) {
         vrm.scene.removeFromParent();
         disposeObject3D(vrm.scene);
       }
