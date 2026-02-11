@@ -2,51 +2,68 @@
 
 import React, { useEffect, useRef } from "react";
 import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
 import { loadVrm } from "@/lib/vrm/loadVrm";
 import { createRenderer } from "@/lib/three/createRenderer";
 import { createScene, createCamera } from "@/lib/three/createScene";
-import { resizeToParent } from "@/lib/three/resize";
 import { disposeObject3D } from "@/lib/vrm/disposeThree";
 
-import { EmotionController } from "@/features/emotions/EmotionController";
-import { AttributeController } from "@/features/attributes/AttributeController";
+// --- IMPORT CONTROLLERS ---
+import { RootFixer } from "@/features/body/RootFixer";
+import { IdleHumanController } from "@/features/emotions/IdleHumanController";
+import { SecondaryPhysicsController } from "@/features/physics/SecondaryPhysicsController";
 import { DanceController } from "@/features/dances/DanceController";
-import { BodyController } from "@/features/body/BodyController";
-import { PhysicsController } from "@/features/physics/PhysicsController";
-import { PoseController } from "@/features/body/PoseController"; // New
-import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
 export default function VrmStage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rafRef = useRef<number | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
 
   useEffect(() => {
     let mounted = true;
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    // 1. Init Renderer (Singleton)
+    if (rendererRef.current) return;
     const renderer = createRenderer(canvas);
+    rendererRef.current = renderer;
+
     const scene = createScene();
-    const camera = createCamera();
+
+    // 2. Init Camera (Positioned for full body)
+    const camera = new THREE.PerspectiveCamera(30.0, window.innerWidth / window.innerHeight, 0.1, 20.0);
+    camera.position.set(0.0, 1.4, 3.5);
+
+    // 3. Init Controls
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0.0, 0.9, 0.0); // Look at center mass
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controlsRef.current = controls;
+
     const clock = new THREE.Clock();
 
+    // 4. Controller Refs
+    let rootFixer: RootFixer | null = null;
+    let idleHuman: IdleHumanController | null = null;
+    let secondaryPhysics: SecondaryPhysicsController | null = null;
+    let dance: DanceController | null = null;
     let vrm: any = null;
-    let controllers: any = {};
 
+    // 5. Resize Logic
     const onResize = () => {
-      resizeToParent(renderer, camera, canvas);
-      if (vrm?.scene) {
-        fitVrmToView(vrm.scene, camera, {
-          targetHeight: 1.6,
-          padding: 1.2,
-          lookAtY: 1.35,
-          ground: true,
-        });
+      if (canvas.parentElement) {
+        camera.aspect = canvas.parentElement.clientWidth / canvas.parentElement.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(canvas.parentElement.clientWidth, canvas.parentElement.clientHeight);
       }
     };
-
     window.addEventListener("resize", onResize);
+    onResize();
 
+    // 6. Load VRM
     (async () => {
       try {
         vrm = await loadVrm("/models/character.vrm");
@@ -54,44 +71,52 @@ export default function VrmStage() {
 
         scene.add(vrm.scene);
 
-        // ✅ CRITICAL: Force an initial update to fix "squeezed" mesh
-        vrm.update(0);
+        // --- INSTANTIATE CONTROLLERS ---
+        rootFixer = new RootFixer(vrm);
+        idleHuman = new IdleHumanController(vrm);
+        secondaryPhysics = new SecondaryPhysicsController(vrm);
+        dance = new DanceController(vrm);
 
-        // Initialize Controllers
-        controllers.emotion = new EmotionController(vrm);
-        controllers.attrs = new AttributeController(vrm);
-        controllers.dance = new DanceController(vrm);
-        controllers.body = new BodyController(vrm);
-        
-        // This now has the safety check fix
-        controllers.physics = new PhysicsController(vrm); 
-        
-        // This rotates the arms down from the T-pose
-        controllers.pose = new PoseController(vrm);
-
-        controllers.emotion.setEmotion("neutral");
-        
-        onResize();
+        console.log("VRM Loaded & Physics Systems Active");
       } catch (e) {
         console.error("Failed to load VRM:", e);
       }
     })();
 
+    // 7. Render Loop
     const animate = () => {
       rafRef.current = requestAnimationFrame(animate);
       const dt = clock.getDelta();
-      const t = clock.getElapsedTime();
+
+      controls.update();
 
       if (vrm) {
-        // Essential: Standard VRM physics and bone update
-        vrm.update(dt);
+        // A. RESET
+        rootFixer?.update(); // Lock root to floor
 
-        const blink = Math.sin(t * 0.5) > 0.98 ? 1 : 0;
-        controllers.emotion?.blink(blink);
-        controllers.emotion?.update(dt);
-        controllers.attrs?.breathe(t);
-        controllers.dance?.update(dt);
-        controllers.body?.update(dt);
+        // B. LOGIC
+        const isDancing = dance?.isPlaying ?? false;
+
+        // Human Idle (Sway/Blink/Look)
+        if (idleHuman) {
+            idleHuman.setEnabled(!isDancing);
+            idleHuman.update(dt);
+        }
+
+        // Secondary Physics (Wind/Fingers)
+        // We run this every frame to inject Wind Gravity
+        if (secondaryPhysics) {
+            secondaryPhysics.setEnabled(!isDancing);
+            secondaryPhysics.update(dt);
+        }
+
+        // Dance
+        dance?.update(dt);
+
+        // C. PHYSICS ENGINE (Must be LAST)
+        // The VRM engine now sees the modified Gravity from SecondaryPhysics
+        // and simulates the skirt/hair swinging to the side.
+        vrm.update(dt);
       }
 
       renderer.render(scene, camera);
@@ -99,15 +124,18 @@ export default function VrmStage() {
 
     animate();
 
+    // 8. Cleanup
     return () => {
       mounted = false;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener("resize", onResize);
-      if (vrm?.scene) {
-        vrm.scene.removeFromParent();
+      if (vrm) {
+        scene.remove(vrm.scene);
         disposeObject3D(vrm.scene);
       }
+      controls.dispose();
       renderer.dispose();
+      rendererRef.current = null;
     };
   }, []);
 
