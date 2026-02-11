@@ -1,44 +1,23 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
-:root {
-  --background: #000000;
-  --foreground: #ffffff;
+@theme {
+  --color-pink-soft: #fbcfe8;
+  --color-rose-glow: #fda4af;
+  --animate-ripple: ripple 1.5s infinite ease-out;
+  --animate-float: float 6s infinite ease-in-out;
+}
+
+@keyframes ripple {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
 }
 
 body {
-  /* Force pitch black to prevent the 'pink' flash during model loading */
   background-color: black !important;
-  color: white;
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
-  height: 100vh;
-  width: 100vw;
-  /* Prevent system gestures on mobile from pulling the UI */
   touch-action: none; 
-}
-
-/* Fix for standard input ghost borders/backgrounds */
-input:-webkit-autofill,
-input:-webkit-autofill:hover, 
-input:-webkit-autofill:focus {
-  -webkit-text-fill-color: white;
-  /* Matches your glass dock background */
-  -webkit-box-shadow: 0 0 0px 1000px rgba(18, 18, 22, 0.95) inset;
-  transition: background-color 5000s ease-in-out 0s;
-}
-
-/* Optimized selection color to match your Avani Purple/Indigo theme */
-::selection {
-  background: rgba(99, 102, 241, 0.3);
-  color: white;
-}
-
-/* Nuclear fix for the 'Top Left' ghost UI elements */
-header, nav, #neural-link-header, .top-bar-label {
-    display: none !important;
-    visibility: hidden !important;
-    pointer-events: none !important;
 }
