@@ -13,7 +13,8 @@ import { AttributeController } from "@/features/attributes/AttributeController";
 import { DanceController } from "@/features/dances/DanceController";
 import { BodyController } from "@/features/body/BodyController";
 import { PhysicsController } from "@/features/physics/PhysicsController";
-import { PoseController } from "@/features/body/PoseController"; // New
+import { PoseController } from "@/features/body/PoseController";
+import { RotationController } from "@/features/body/RotationController";
 import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
 export default function VrmStage() {
@@ -53,24 +54,22 @@ export default function VrmStage() {
         if (!mounted) return;
 
         scene.add(vrm.scene);
+        
+        // 1. Snaps mesh to bones to prevent "squeezing"
+        vrm.update(0); 
 
-        // ✅ CRITICAL: Force an initial update to fix "squeezed" mesh
-        vrm.update(0);
-
-        // Initialize Controllers
+        // 2. Initialize Controllers
         controllers.emotion = new EmotionController(vrm);
         controllers.attrs = new AttributeController(vrm);
         controllers.dance = new DanceController(vrm);
         controllers.body = new BodyController(vrm);
-        
-        // This now has the safety check fix
         controllers.physics = new PhysicsController(vrm); 
+        controllers.pose = new PoseController(vrm); // Fixes T-Pose arms
         
-        // This rotates the arms down from the T-pose
-        controllers.pose = new PoseController(vrm);
+        // 3. New Touch/Mouse Rotation Controller
+        controllers.rotation = new RotationController(vrm, canvas);
 
         controllers.emotion.setEmotion("neutral");
-        
         onResize();
       } catch (e) {
         console.error("Failed to load VRM:", e);
@@ -83,15 +82,18 @@ export default function VrmStage() {
       const t = clock.getElapsedTime();
 
       if (vrm) {
-        // Essential: Standard VRM physics and bone update
         vrm.update(dt);
 
+        // Core secondary animations
         const blink = Math.sin(t * 0.5) > 0.98 ? 1 : 0;
         controllers.emotion?.blink(blink);
         controllers.emotion?.update(dt);
         controllers.attrs?.breathe(t);
         controllers.dance?.update(dt);
         controllers.body?.update(dt);
+        
+        // Handle rotation momentum
+        controllers.rotation?.update(dt);
       }
 
       renderer.render(scene, camera);
@@ -112,8 +114,11 @@ export default function VrmStage() {
   }, []);
 
   return (
-    <div style={{ width: "100vw", height: "100vh", background: "#121212" }}>
-      <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+    <div style={{ width: "100vw", height: "100vh", background: "#121212", touchAction: "none" }}>
+      <canvas 
+        ref={canvasRef} 
+        style={{ width: "100%", height: "100%", display: "block", cursor: "grab" }} 
+      />
     </div>
   );
 }
