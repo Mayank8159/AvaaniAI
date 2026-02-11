@@ -13,6 +13,10 @@ import { RootFixer } from "@/features/body/RootFixer";
 import { IdleHumanController } from "@/features/emotions/IdleHumanController";
 import { SecondaryPhysicsController } from "@/features/physics/SecondaryPhysicsController";
 import { DanceController } from "@/features/dances/DanceController";
+import { BodyController } from "@/features/body/BodyController";
+import { PhysicsController } from "@/features/physics/PhysicsController";
+import { PoseController } from "@/features/body/PoseController"; // New
+import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
 export default function VrmStage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -71,13 +75,24 @@ export default function VrmStage() {
 
         scene.add(vrm.scene);
 
-        // --- INSTANTIATE CONTROLLERS ---
-        rootFixer = new RootFixer(vrm);
-        idleHuman = new IdleHumanController(vrm);
-        secondaryPhysics = new SecondaryPhysicsController(vrm);
-        dance = new DanceController(vrm);
+        // ✅ CRITICAL: Force an initial update to fix "squeezed" mesh
+        vrm.update(0);
 
-        console.log("VRM Loaded & Physics Systems Active");
+        // Initialize Controllers
+        controllers.emotion = new EmotionController(vrm);
+        controllers.attrs = new AttributeController(vrm);
+        controllers.dance = new DanceController(vrm);
+        controllers.body = new BodyController(vrm);
+        
+        // This now has the safety check fix
+        controllers.physics = new PhysicsController(vrm); 
+        
+        // This rotates the arms down from the T-pose
+        controllers.pose = new PoseController(vrm);
+
+        controllers.emotion.setEmotion("neutral");
+        
+        onResize();
       } catch (e) {
         console.error("Failed to load VRM:", e);
       }
@@ -91,32 +106,15 @@ export default function VrmStage() {
       controls.update();
 
       if (vrm) {
-        // A. RESET
-        rootFixer?.update(); // Lock root to floor
-
-        // B. LOGIC
-        const isDancing = dance?.isPlaying ?? false;
-
-        // Human Idle (Sway/Blink/Look)
-        if (idleHuman) {
-            idleHuman.setEnabled(!isDancing);
-            idleHuman.update(dt);
-        }
-
-        // Secondary Physics (Wind/Fingers)
-        // We run this every frame to inject Wind Gravity
-        if (secondaryPhysics) {
-            secondaryPhysics.setEnabled(!isDancing);
-            secondaryPhysics.update(dt);
-        }
-
-        // Dance
-        dance?.update(dt);
-
-        // C. PHYSICS ENGINE (Must be LAST)
-        // The VRM engine now sees the modified Gravity from SecondaryPhysics
-        // and simulates the skirt/hair swinging to the side.
+        // Essential: Standard VRM physics and bone update
         vrm.update(dt);
+
+        const blink = Math.sin(t * 0.5) > 0.98 ? 1 : 0;
+        controllers.emotion?.blink(blink);
+        controllers.emotion?.update(dt);
+        controllers.attrs?.breathe(t);
+        controllers.dance?.update(dt);
+        controllers.body?.update(dt);
       }
 
       renderer.render(scene, camera);
@@ -140,8 +138,11 @@ export default function VrmStage() {
   }, []);
 
   return (
-    <div style={{ width: "100vw", height: "100vh", background: "#121212" }}>
-      <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
+    <div style={{ width: "100vw", height: "100vh", background: "#121212", touchAction: "none" }}>
+      <canvas 
+        ref={canvasRef} 
+        style={{ width: "100%", height: "100%", display: "block", cursor: "grab" }} 
+      />
     </div>
   );
 }
