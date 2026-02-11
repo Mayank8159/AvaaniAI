@@ -2,8 +2,8 @@ import "./globals.css";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "AI Wife",
-  description: "AI Wife VRM Viewer",
+  title: "AvaaniAI",
+  description: "AI Avatar Experience",
 };
 
 export default function RootLayout({

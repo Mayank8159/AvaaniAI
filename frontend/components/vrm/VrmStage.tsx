@@ -3,6 +3,8 @@
 import React, { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import type { VRM } from "@pixiv/three-vrm";
+
 import { loadVrm } from "@/lib/vrm/loadVrm";
 import { createRenderer } from "@/lib/three/createRenderer";
 import { createScene } from "@/lib/three/createScene";
@@ -14,7 +16,7 @@ import { PoseController } from "@/features/body/PoseController";
 import { IdleBodyController } from "@/features/body/IdleBodyController";
 import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
-export default function VrmScene() {
+export default function VrmStage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -53,12 +55,11 @@ export default function VrmScene() {
     controls.enableDamping = true;
     controls.target.set(0, 1.1, 0);
 
-
-    // ✅ Wrapper for the avatar (rotate this, not vrm.scene)
+    // Wrapper for the avatar (rotate this, not vrm.scene)
     const avatarRoot = new THREE.Group();
     scene.add(avatarRoot);
 
-    let vrm: any = null;
+    let vrm: VRM | null = null;
 
     const controllers: {
       body: BodyController | null;
@@ -66,10 +67,6 @@ export default function VrmScene() {
       pose: PoseController | null;
       idle: IdleBodyController | null;
     } = { body: null, physics: null, pose: null, idle: null };
-
-    let vrm: { scene: THREE.Scene; springBoneManager?: { reset: () => void }; update: (dt: number) => void } | null = null;
-    const controllers: { body: BodyController | null; physics: PhysicsController | null; pose: PoseController | null } = { body: null, physics: null, pose: null };
-
 
     const onResize = () => {
       if (!canvas.parentElement) return;
@@ -82,13 +79,13 @@ export default function VrmScene() {
     };
     window.addEventListener("resize", onResize);
 
-    // ✅ Robust facing fix: try ±Z then ±X and pick best
+    // Robust facing fix: try ±Z then ±X and pick best
     const faceAvatarToCamera = () => {
       if (!vrm) return;
 
       const humanoid = vrm.humanoid;
       const hips =
-        humanoid?.getNormalizedBoneNode?.("hips") ||
+        humanoid?.getNormalizedBoneNode?.("hips") ??
         humanoid?.getRawBoneNode?.("hips");
 
       const basisObj: THREE.Object3D = hips || vrm.scene;
@@ -121,21 +118,17 @@ export default function VrmScene() {
 
     (async () => {
       try {
-        vrm = await loadVrm("/models/character.vrm");
-        if (!mounted) return;
+        const loaded = (await loadVrm("/models/character.vrm")) as VRM | null;
+        if (!mounted || !loaded) return;
 
+        vrm = loaded;
 
         // Shadows for meshes
-        vrm.scene.traverse((obj: any) => {
-          if (obj.isMesh) {
-            obj.castShadow = true;
-            obj.receiveShadow = true;
-
-        vrm.scene.traverse((obj: THREE.Object3D) => {
-          if ((obj as THREE.Mesh).isMesh) {
-            (obj as THREE.Mesh).castShadow = true;
-            (obj as THREE.Mesh).receiveShadow = true;
-
+        vrm.scene.traverse((obj) => {
+          const mesh = obj as THREE.Mesh;
+          if (mesh.isMesh) {
+            mesh.castShadow = true;
+            mesh.receiveShadow = true;
           }
         });
 
@@ -156,10 +149,9 @@ export default function VrmScene() {
           slerp: 0.22,
         });
 
-        // Wake springs
-        if (vrm.springBoneManager) vrm.springBoneManager.reset();
+        // Wake springs (depends on VRM version; keep optional)
+        if (vrm.springBoneManager?.reset) vrm.springBoneManager.reset();
 
-        // Your existing setting
         controllers.body.setBodyWeight(0.2);
 
         // Settle once
@@ -189,17 +181,11 @@ export default function VrmScene() {
       const t = clock.getElapsedTime();
 
       if (vrm) {
-        // Keep pose/body constraints first
         controllers.pose?.update?.(dt);
         controllers.body?.update?.(dt);
-
-        // Add subtle idle motion
         controllers.idle?.update?.(dt);
-
-        // Physics wind
         controllers.physics?.applyWind?.(t);
 
-        // Final VRM solver
         vrm.update(dt);
       }
 
@@ -215,7 +201,11 @@ export default function VrmScene() {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener("resize", onResize);
 
-      if (vrm) disposeObject3D(vrm.scene);
+      // Remove & dispose avatar
+      if (vrm?.scene) {
+        avatarRoot.remove(vrm.scene);
+        disposeObject3D(vrm.scene);
+      }
 
       controls.dispose();
       renderer.dispose();
