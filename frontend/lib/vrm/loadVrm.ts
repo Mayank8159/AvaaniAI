@@ -1,16 +1,24 @@
-import * as THREE from "three";
 import { GLTFLoader } from "three-stdlib";
 import { VRMLoaderPlugin, VRM, VRMUtils } from "@pixiv/three-vrm";
 
 export async function loadVrm(url: string): Promise<VRM> {
   const loader = new GLTFLoader();
-  loader.register((parser) => new VRMLoaderPlugin(parser));
 
-  const gltf = await new Promise<any>((resolve, reject) => {
-    loader.load(url, resolve, undefined, reject);
+  // ✅ Fix 1: type mismatch for parser / plugin
+  loader.register((parser: any) => new VRMLoaderPlugin(parser) as any);
+
+  // ✅ Type the GLTF enough to access userData safely
+  const gltf = await new Promise<{ userData: { vrm?: VRM } }>((resolve, reject) => {
+    loader.load(
+      url,
+      (g) => resolve(g as any),
+      undefined,
+      (e) => reject(e)
+    );
   });
 
-  const vrm: VRM = gltf.userData.vrm;
+  // ✅ Fix 2: userData typing for vrm
+  const vrm = gltf.userData.vrm;
   if (!vrm) throw new Error("VRM not found in gltf.userData.vrm");
 
   // Optional cleanup (performance)
