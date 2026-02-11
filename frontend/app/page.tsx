@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { Mic, Square, Loader2, Heart } from "lucide-react";
 import Script from "next/script";
 import VrmStage from "@/components/vrm/VrmStage";
@@ -21,47 +21,55 @@ export default function Home() {
 
   const recognitionRef = useRef<any>(null);
 
-  // --- ENHANCED ANIME VOICE LOGIC ---
-  const speakAnimeVoice = (text: string) => {
-    if (!window.speechSynthesis) return;
+  // --- STABLE VOICE LOGIC FOR PRODUCTION ---
+  const speakAnimeVoice = useCallback((text: string) => {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
 
+    // 1. Cancel any pending speech
     window.speechSynthesis.cancel();
 
-    // Remove any remaining symbols or bracketed tags so she doesn't read them
-    const speechText = text.replace(/\[.*?\]/g, "").replace(/[^\w\s?.!,]/g, "").trim();
+    // 2. Clean text: No symbols, no bracketed tags
+    const speechText = text
+      .replace(/\[.*?\]/g, "")
+      .replace(/[^\w\s?.!,]/g, "")
+      .trim();
 
     const utterance = new SpeechSynthesisUtterance(speechText);
     
-    // High-pitched and bubbly settings
-    utterance.pitch = 1.8; 
-    utterance.rate = 1.15;
+    // Girly Tuning
+    utterance.pitch = 1.7; 
+    utterance.rate = 1.1;
     utterance.volume = 1.0;
 
-    // Find the best "Girl" voice
-    const voices = window.speechSynthesis.getVoices();
-    const preferredVoices = [
-      "Google UK English Female",
-      "Microsoft Zira",
-      "Samantha",
-      "Mei-Jia",
-      "Female"
-    ];
+    // 3. Find Voice (Ensures it works even if getVoices() is delayed)
+    const getBestVoice = () => {
+      const voices = window.speechSynthesis.getVoices();
+      const preferred = ["Google UK English Female", "Samantha", "Microsoft Zira", "Mei-Jia", "Female"];
+      return voices.find(v => preferred.some(p => v.name.includes(p))) || voices[0];
+    };
 
-    const selectedVoice = voices.find(v => 
-      preferredVoices.some(pv => v.name.includes(pv))
-    );
-    
-    if (selectedVoice) utterance.voice = selectedVoice;
+    utterance.voice = getBestVoice();
 
     utterance.onstart = () => setIsSpeaking(true);
     utterance.onend = () => {
       setIsSpeaking(false);
-      setTimeout(() => setEmotion("neutral"), 1000);
+      setTimeout(() => setEmotion("neutral"), 800);
     };
 
     window.speechSynthesis.speak(utterance);
-  };
+  }, []);
 
+  // Initialize voices for browsers like Chrome/Safari that load them late
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.getVoices();
+      if (window.speechSynthesis.onvoiceschanged !== undefined) {
+        window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+      }
+    }
+  }, []);
+
+  // --- SPEECH RECOGNITION SETUP ---
   useEffect(() => {
     if (typeof window !== "undefined") {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -70,6 +78,7 @@ export default function Home() {
         recognition.continuous = true;
         recognition.interimResults = true;
         recognition.lang = "en-US";
+
         recognition.onresult = (event: any) => {
           let current = "";
           for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -77,7 +86,13 @@ export default function Home() {
           }
           setLiveSpeech(current);
         };
-        recognition.onend = () => { if (isListening) recognition.start(); };
+
+        recognition.onend = () => {
+          if (isListening) {
+            try { recognition.start(); } catch(e) {}
+          }
+        };
+
         recognitionRef.current = recognition;
       }
     }
@@ -97,7 +112,7 @@ export default function Home() {
 
       const rawContent = response.message.content;
 
-      // 1. Logic to extract emotion and clean text for display
+      // Extract emotion and clean the display text
       const emotionMatch = rawContent.match(/\[(.*?)\]/);
       const detectedEmotion = emotionMatch ? emotionMatch[1].toLowerCase() : "neutral";
       const cleanText = rawContent.replace(/\[.*?\]/g, "").trim();
@@ -105,7 +120,7 @@ export default function Home() {
       setEmotion(detectedEmotion);
       setTranscript(cleanText);
       
-      // 2. Speak the clean text (symbols filtered inside function)
+      // Trigger voice
       speakAnimeVoice(cleanText);
 
     } catch (err) {
@@ -116,6 +131,9 @@ export default function Home() {
   };
 
   const startListening = async () => {
+    // Chrome/Safari requirement: Speak an empty string to "unlock" audio context
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(""));
+    
     setTranscript("");
     setLiveSpeech("");
     setEmotion("neutral");
@@ -124,7 +142,7 @@ export default function Home() {
       recognitionRef.current?.start();
       setIsListening(true);
     } catch (err) {
-      alert("I need your mic, darling! 🎤");
+      alert("Please allow mic access! 🎤");
     }
   };
 
@@ -137,12 +155,16 @@ export default function Home() {
   return (
     <main className="fixed inset-0 w-screen h-screen bg-black overflow-hidden z-[9999] font-sans select-none">
       <Script src="https://js.puter.com/v2/" strategy="afterInteractive" />
+      
+      {/* Background Glow */}
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,#3d1a3d_0%,#000_80%)]" />
 
+      {/* VRM Model Layer */}
       <div className="absolute inset-0 z-10 pointer-events-none">
         <VrmStage currentEmotion={emotion} isSpeaking={isSpeaking} />
       </div>
 
+      {/* TRANSCRIPT BUBBLE */}
       <div className={`absolute top-6 left-1/2 -translate-x-1/2 z-40 w-[85%] max-w-[280px] transition-all duration-500 ${
         (transcript || liveSpeech) ? "opacity-100 scale-100" : "opacity-0 scale-95"
       }`}>
@@ -156,19 +178,25 @@ export default function Home() {
         </div>
       </div>
 
+      {/* MIC DOCK */}
       <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-50 flex items-center gap-6">
-        {isListening && <div className="flex items-end gap-1 h-4"><div className="wave-bar"/><div className="wave-bar"/></div>}
         <button
           onClick={isListening ? stopListening : startListening}
-          className={`w-16 h-16 rounded-full flex items-center justify-center transition-all ${
-            isListening ? "bg-rose-500/20 border-rose-300 scale-110 shadow-lg" : "bg-white/5 border-white/10"
+          disabled={isProcessing}
+          className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-500 border ${
+            isListening 
+              ? "bg-rose-500/20 border-rose-300 scale-110 shadow-[0_0_20px_rgba(244,63,94,0.4)]" 
+              : "bg-white/5 border-white/10 active:scale-95"
           }`}
         >
-          {isProcessing ? <Loader2 className="animate-spin text-pink-200" size={24} /> : 
-           isListening ? <Square className="text-white fill-white" size={18} /> : 
-           <Mic className="text-pink-100" size={26} />}
+          {isProcessing ? (
+            <Loader2 className="animate-spin text-pink-200" size={24} />
+          ) : isListening ? (
+            <Square className="text-white fill-white" size={18} />
+          ) : (
+            <Mic className="text-pink-100" size={26} />
+          )}
         </button>
-        {isListening && <div className="flex items-end gap-1 h-4"><div className="wave-bar"/><div className="wave-bar"/></div>}
       </div>
     </main>
   );
