@@ -16,6 +16,11 @@ import { PoseController } from "@/features/body/PoseController";
 import { IdleBodyController } from "@/features/body/IdleBodyController";
 import { fitVrmToView } from "@/lib/vrm/fitVrmToView";
 
+import {
+  LiveContextController,
+  type AvaaniLiveContext,
+} from "@/features/live/LiveContextController";
+
 export default function VrmStage() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
@@ -37,7 +42,7 @@ export default function VrmStage() {
     const scene = createScene();
     const clock = new THREE.Clock();
 
-    // Stage floor
+    // Floor
     const floor = new THREE.Mesh(
       new THREE.PlaneGeometry(100, 100),
       new THREE.ShadowMaterial({ opacity: 0.2 })
@@ -55,7 +60,7 @@ export default function VrmStage() {
     controls.enableDamping = true;
     controls.target.set(0, 1.1, 0);
 
-    // Wrapper for the avatar (rotate this, not vrm.scene)
+    // Avatar wrapper
     const avatarRoot = new THREE.Group();
     scene.add(avatarRoot);
 
@@ -66,24 +71,24 @@ export default function VrmStage() {
       physics: PhysicsController | null;
       pose: PoseController | null;
       idle: IdleBodyController | null;
-    } = { body: null, physics: null, pose: null, idle: null };
+      live: LiveContextController | null;
+    } = { body: null, physics: null, pose: null, idle: null, live: null };
 
     const onResize = () => {
       if (!canvas.parentElement) return;
       const w = canvas.parentElement.clientWidth;
       const h = canvas.parentElement.clientHeight;
-
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h, false);
     };
     window.addEventListener("resize", onResize);
 
-    // Robust facing fix: try ±Z then ±X and pick best
+    // Face camera helper
     const faceAvatarToCamera = () => {
       if (!vrm) return;
 
-      const humanoid = vrm.humanoid;
+      const humanoid: any = (vrm as any).humanoid;
       const hips =
         humanoid?.getNormalizedBoneNode?.("hips") ??
         humanoid?.getRawBoneNode?.("hips");
@@ -106,24 +111,86 @@ export default function VrmStage() {
       const minusX = new THREE.Vector3(-1, 0, 0).applyQuaternion(q).normalize();
 
       const candidates: Array<{ yaw: number; score: number }> = [
-        { yaw: 0, score: plusZ.dot(toCam) }, // front is +Z
-        { yaw: Math.PI, score: minusZ.dot(toCam) }, // front is -Z
-        { yaw: -Math.PI / 2, score: plusX.dot(toCam) }, // front is +X
-        { yaw: Math.PI / 2, score: minusX.dot(toCam) }, // front is -X
+        { yaw: 0, score: plusZ.dot(toCam) },
+        { yaw: Math.PI, score: minusZ.dot(toCam) },
+        { yaw: -Math.PI / 2, score: plusX.dot(toCam) },
+        { yaw: Math.PI / 2, score: minusX.dot(toCam) },
       ];
 
       candidates.sort((a, b) => b.score - a.score);
       avatarRoot.rotation.y = candidates[0]?.yaw ?? 0;
     };
 
+    // ---- LIVE CONTEXT CONNECTION (WS preferred, HTTP fallback) ----
+    const WS_URL = process.env.NEXT_PUBLIC_AVAANI_WS_URL;
+    const HTTP_URL = process.env.NEXT_PUBLIC_AVAANI_HTTP_URL;
+
+    let ws: WebSocket | null = null;
+    let pollTimer: number | null = null;
+
+    const handleIncoming = (raw: unknown) => {
+      // sometimes backend wraps: {type, payload}, sometimes sends direct JSON
+      const msg = raw as any;
+      const ctx: AvaaniLiveContext = msg?.payload ?? msg;
+
+      controllers.live?.setContext(ctx);
+    };
+
+    const startWebSocket = () => {
+      if (!WS_URL) return false;
+
+      try {
+        ws = new WebSocket(WS_URL);
+
+        ws.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            handleIncoming(data);
+          } catch {
+            // ignore malformed frames
+          }
+        };
+
+        ws.onclose = () => {
+          // Optional: attempt reconnect (simple backoff)
+          if (!mounted) return;
+          setTimeout(() => {
+            if (mounted) startWebSocket();
+          }, 1000);
+        };
+
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const startPolling = () => {
+      if (!HTTP_URL) return;
+
+      const poll = async () => {
+        if (!mounted) return;
+        try {
+          const res = await fetch(HTTP_URL, { cache: "no-store" });
+          if (!res.ok) return;
+          const data = await res.json();
+          handleIncoming(data);
+        } catch {
+          // ignore
+        }
+      };
+
+      poll(); // immediate
+      pollTimer = window.setInterval(poll, 200); // 5Hz is enough for smooth avatar
+    };
+
     (async () => {
       try {
         const loaded = (await loadVrm("/models/character.vrm")) as VRM | null;
         if (!mounted || !loaded) return;
-
         vrm = loaded;
 
-        // Shadows for meshes
+        // shadows
         vrm.scene.traverse((obj) => {
           const mesh = obj as THREE.Mesh;
           if (mesh.isMesh) {
@@ -132,15 +199,12 @@ export default function VrmStage() {
           }
         });
 
-        // Add VRM under wrapper
         avatarRoot.add(vrm.scene);
 
-        // Controllers
+        // controllers
         controllers.pose = new PoseController(vrm);
         controllers.body = new BodyController(vrm);
         controllers.physics = new PhysicsController(vrm);
-
-        // Subtle "alive" motion layer
         controllers.idle = new IdleBodyController(vrm, {
           intensity: 0.9,
           breathe: 1.0,
@@ -149,25 +213,26 @@ export default function VrmStage() {
           slerp: 0.22,
         });
 
-        // Wake springs (depends on VRM version; keep optional)
-        if (vrm.springBoneManager?.reset) vrm.springBoneManager.reset();
+        // ✅ Live context controller (expressions + head look)
+        controllers.live = new LiveContextController(vrm);
+
+        // Wake springs (depends on your three-vrm version)
+        if ((vrm as any).springBoneManager?.reset) (vrm as any).springBoneManager.reset();
 
         controllers.body.setBodyWeight(0.2);
 
-        // Settle once
         vrm.update(0);
-
         onResize();
 
-        // Fit camera to the wrapper
         fitVrmToView(avatarRoot, camera, { padding: 0.9 });
-
-        // Face camera AFTER fitting
         faceAvatarToCamera();
 
-        // Keep orbit stable
         controls.target.set(0, 1.1, 0);
         controls.update();
+
+        // start live feed AFTER VRM is ready
+        const wsStarted = startWebSocket();
+        if (!wsStarted) startPolling();
       } catch (e) {
         console.error(e);
       }
@@ -181,11 +246,19 @@ export default function VrmStage() {
       const t = clock.getElapsedTime();
 
       if (vrm) {
+        // Your existing logic order
         controllers.pose?.update?.(dt);
         controllers.body?.update?.(dt);
-        controllers.idle?.update?.(dt);
-        controllers.physics?.applyWind?.(t);
 
+        // ✅ Apply live context (expressions + head)
+        controllers.live?.update(dt);
+
+        // ✅ Drive idle intensity by live energy
+        const energy = controllers.live?.getEnergy?.() ?? 0.9;
+        controllers.idle?.setConfig?.({ intensity: 0.5 + energy * 0.7 });
+        controllers.idle?.update?.(dt);
+
+        controllers.physics?.applyWind?.(t);
         vrm.update(dt);
       }
 
@@ -201,7 +274,9 @@ export default function VrmStage() {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener("resize", onResize);
 
-      // Remove & dispose avatar
+      if (pollTimer) window.clearInterval(pollTimer);
+      if (ws) ws.close();
+
       if (vrm?.scene) {
         avatarRoot.remove(vrm.scene);
         disposeObject3D(vrm.scene);
