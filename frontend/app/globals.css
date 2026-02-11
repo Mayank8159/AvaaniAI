@@ -21,3 +21,14 @@ body {
   background-color: black !important;
   touch-action: none; 
 }
+
+@keyframes wave {
+  0%, 100% { height: 4px; }
+  50% { height: 16px; }
+}
+.wave-bar {
+  width: 3px;
+  background-color: #fda4af;
+  border-radius: 99px;
+  animation: wave 1s infinite ease-in-out;
+}
