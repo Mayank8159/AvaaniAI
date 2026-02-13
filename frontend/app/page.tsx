@@ -1,75 +1,66 @@
 "use client";
 
 import React, { useState, useRef, useEffect, useCallback } from "react";
-import { Mic, Square, Loader2, Heart } from "lucide-react";
+import { Mic, Square, Loader2 } from "lucide-react";
 import Script from "next/script";
 import VrmStage from "@/components/vrm/VrmStage";
-
-declare global {
-  interface Window {
-    puter: any;
-  }
-}
 
 export default function Home() {
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
   const [transcript, setTranscript] = useState("");
   const [liveSpeech, setLiveSpeech] = useState("");
-  const [emotion, setEmotion] = useState("neutral");
-
+  
+  const stageRef = useRef<any>(null);
   const recognitionRef = useRef<any>(null);
+  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
 
-  // --- STABLE VOICE LOGIC FOR PRODUCTION ---
-  const speakAnimeVoice = useCallback((text: string) => {
-    if (typeof window === "undefined" || !window.speechSynthesis) return;
-
-    // 1. Cancel any pending speech
-    window.speechSynthesis.cancel();
-
-    // 2. Clean text: No symbols, no bracketed tags
-    const speechText = text
-      .replace(/\[.*?\]/g, "")
-      .replace(/[^\w\s?.!,]/g, "")
-      .trim();
-
-    const utterance = new SpeechSynthesisUtterance(speechText);
-    
-    // Girly Tuning
-    utterance.pitch = 1.7; 
-    utterance.rate = 1.1;
-    utterance.volume = 1.0;
-
-    // 3. Find Voice (Ensures it works even if getVoices() is delayed)
-    const getBestVoice = () => {
-      const voices = window.speechSynthesis.getVoices();
-      const preferred = ["Google UK English Female", "Samantha", "Microsoft Zira", "Mei-Jia", "Female"];
-      return voices.find(v => preferred.some(p => v.name.includes(p))) || voices[0];
-    };
-
-    utterance.voice = getBestVoice();
-
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => {
-      setIsSpeaking(false);
-      setTimeout(() => setEmotion("neutral"), 800);
-    };
-
-    window.speechSynthesis.speak(utterance);
-  }, []);
-
-  // Initialize voices for browsers like Chrome/Safari that load them late
+  // --- 1. VOICE WARMUP ---
   useEffect(() => {
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      window.speechSynthesis.getVoices();
-      if (window.speechSynthesis.onvoiceschanged !== undefined) {
-        window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
-      }
+    if (typeof window !== "undefined") {
+      const synth = window.speechSynthesis;
+      const updateVoices = () => setAvailableVoices(synth.getVoices());
+      updateVoices();
+      if (synth.onvoiceschanged !== undefined) synth.onvoiceschanged = updateVoices;
     }
   }, []);
 
-  // --- SPEECH RECOGNITION SETUP ---
+  // --- 2. CLEAN & SPEAK LOGIC ---
+  const speakAnimeVoice = useCallback((text: string) => {
+    if (typeof window === "undefined" || !window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+
+    // Remove emojis and icons so they aren't read as words
+    const cleanText = text
+      .replace(/\[.*?\]/g, "") 
+      .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "")
+      .replace(/[✨🎀💖🌟⭐🌸💢💤💭]/g, "")
+      .trim();
+
+    if (!cleanText) return;
+
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    utterance.pitch = 1.45; 
+    utterance.rate = 0.95; 
+
+    const feminineVoice = availableVoices.find(v => 
+      v.name.includes("Google") && v.name.includes("Female") || 
+      v.name.includes("Microsoft Aria") || 
+      v.name.includes("Samantha") || 
+      v.name.includes("Zira")
+    );
+
+    if (feminineVoice) utterance.voice = feminineVoice;
+
+    utterance.onboundary = (event) => {
+      if (event.name === 'word') stageRef.current?.triggerMouthPop(); 
+    };
+
+    utterance.onend = () => stageRef.current?.stopMouth();
+    window.speechSynthesis.speak(utterance);
+  }, [availableVoices]);
+
+  // --- 3. SPEECH RECOGNITION ---
   useEffect(() => {
     if (typeof window !== "undefined") {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -77,125 +68,63 @@ export default function Home() {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
         recognition.interimResults = true;
-        recognition.lang = "en-US";
-
-        recognition.onresult = (event: any) => {
-          let current = "";
-          for (let i = event.resultIndex; i < event.results.length; i++) {
-            current += event.results[i][0].transcript;
-          }
-          setLiveSpeech(current);
+        recognition.onresult = (e: any) => {
+          let str = "";
+          for (let i = e.resultIndex; i < e.results.length; i++) str += e.results[i][0].transcript;
+          setLiveSpeech(str);
         };
-
-        recognition.onend = () => {
-          if (isListening) {
-            try { recognition.start(); } catch(e) {}
-          }
-        };
-
         recognitionRef.current = recognition;
       }
     }
-  }, [isListening]);
+  }, []);
 
-  const getGrokResponse = async (text: string) => {
-    if (!text) return;
+  const handleAI = async () => {
+    if (!liveSpeech) return;
+    if (!(window as any).puter) return;
+
     setIsProcessing(true);
-    setTranscript("");
-
     try {
-      const response = await window.puter.ai.chat(
-        `User: "${text}". Respond as a cute, bubbly anime girl. Max 12 words. 
-        Add exactly one tag at the end: [happy], [sad], [surprised], or [relaxed].`,
-        { model: 'x-ai/grok-4.1-fast' }
+      const res = await (window as any).puter.ai.chat(
+        `You are a cute, caring anime girl. Use emojis in text but keep response short. Respond to: ${liveSpeech}`,
+        { model: 'gpt-4o' } 
       );
-
-      const rawContent = response.message.content;
-
-      // Extract emotion and clean the display text
-      const emotionMatch = rawContent.match(/\[(.*?)\]/);
-      const detectedEmotion = emotionMatch ? emotionMatch[1].toLowerCase() : "neutral";
-      const cleanText = rawContent.replace(/\[.*?\]/g, "").trim();
-
-      setEmotion(detectedEmotion);
-      setTranscript(cleanText);
-      
-      // Trigger voice
-      speakAnimeVoice(cleanText);
-
+      const clean = res.message.content.trim();
+      setTranscript(clean);
+      speakAnimeVoice(clean);
     } catch (err) {
-      setTranscript("Baka! My connection is fuzzy... 🎀");
+      setTranscript("Connection error! Gomen... 🎀");
     } finally {
       setIsProcessing(false);
     }
   };
 
-  const startListening = async () => {
-    // Chrome/Safari requirement: Speak an empty string to "unlock" audio context
-    window.speechSynthesis.speak(new SpeechSynthesisUtterance(""));
-    
-    setTranscript("");
-    setLiveSpeech("");
-    setEmotion("neutral");
-    try {
-      await navigator.mediaDevices.getUserMedia({ audio: true });
-      recognitionRef.current?.start();
-      setIsListening(true);
-    } catch (err) {
-      alert("Please allow mic access! 🎤");
-    }
-  };
-
-  const stopListening = () => {
-    recognitionRef.current?.stop();
-    setIsListening(false);
-    if (liveSpeech) getGrokResponse(liveSpeech);
-  };
-
   return (
-    <main className="fixed inset-0 w-screen h-screen bg-black overflow-hidden z-[9999] font-sans select-none">
+    <main className="fixed inset-0 bg-[#0a0a0a] overflow-hidden">
       <Script src="https://js.puter.com/v2/" strategy="afterInteractive" />
-      
-      {/* Background Glow */}
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_30%,#3d1a3d_0%,#000_80%)]" />
+      <div className="absolute inset-0 z-10"><VrmStage ref={stageRef} /></div>
 
-      {/* VRM Model Layer */}
-      <div className="absolute inset-0 z-10 pointer-events-none">
-        <VrmStage currentEmotion={emotion} isSpeaking={isSpeaking} />
-      </div>
-
-      {/* TRANSCRIPT BUBBLE */}
-      <div className={`absolute top-6 left-1/2 -translate-x-1/2 z-40 w-[85%] max-w-[280px] transition-all duration-500 ${
-        (transcript || liveSpeech) ? "opacity-100 scale-100" : "opacity-0 scale-95"
-      }`}>
-        <div className="px-4 py-2.5 rounded-2xl bg-pink-400/10 backdrop-blur-xl border border-pink-200/30 shadow-[0_0_20px_rgba(255,182,193,0.15)]">
-          <div className="flex flex-col items-center">
-            <Heart size={8} className={`mb-1 ${isListening ? "fill-rose-400 text-rose-400 animate-pulse" : "text-pink-300/20"}`} />
-            <p className="text-pink-50 text-[13px] font-medium text-center leading-tight">
-              {isListening ? (liveSpeech || "...") : transcript}
-            </p>
-          </div>
+      <div className={`absolute top-12 left-1/2 -translate-x-1/2 z-30 transition-all duration-500 ${transcript || liveSpeech ? "opacity-100" : "opacity-0"}`}>
+        <div className="bg-pink-900/60 backdrop-blur-xl px-6 py-3 rounded-2xl border border-pink-400/30 text-white text-center shadow-2xl">
+          <p className="text-sm font-medium">{isListening ? liveSpeech : transcript}</p>
         </div>
       </div>
 
-      {/* MIC DOCK */}
-      <div className="absolute bottom-12 left-1/2 -translate-x-1/2 z-50 flex items-center gap-6">
+      <div className="absolute bottom-16 left-1/2 -translate-x-1/2 z-40">
         <button
-          onClick={isListening ? stopListening : startListening}
-          disabled={isProcessing}
-          className={`w-16 h-16 rounded-full flex items-center justify-center transition-all duration-500 border ${
-            isListening 
-              ? "bg-rose-500/20 border-rose-300 scale-110 shadow-[0_0_20px_rgba(244,63,94,0.4)]" 
-              : "bg-white/5 border-white/10 active:scale-95"
-          }`}
+          onClick={() => {
+            if (isListening) {
+              recognitionRef.current?.stop();
+              setIsListening(false);
+              handleAI();
+            } else {
+              setLiveSpeech(""); setTranscript("");
+              recognitionRef.current?.start();
+              setIsListening(true);
+            }
+          }}
+          className={`w-20 h-20 rounded-full flex items-center justify-center border-2 transition-all ${isListening ? "bg-rose-500/20 border-rose-400 scale-110 shadow-[0_0_40px_rgba(244,63,94,0.5)]" : "bg-white/5 border-white/10"}`}
         >
-          {isProcessing ? (
-            <Loader2 className="animate-spin text-pink-200" size={24} />
-          ) : isListening ? (
-            <Square className="text-white fill-white" size={18} />
-          ) : (
-            <Mic className="text-pink-100" size={26} />
-          )}
+          {isProcessing ? <Loader2 className="animate-spin text-white" /> : isListening ? <Square className="text-white fill-white" size={20} /> : <Mic className="text-white" size={32} />}
         </button>
       </div>
     </main>

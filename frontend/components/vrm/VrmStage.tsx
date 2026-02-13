@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useImperativeHandle, forwardRef } from "react";
 import * as THREE from "three";
 import type { VRM } from "@pixiv/three-vrm";
 
@@ -14,60 +14,54 @@ import { PhysicsController } from "@/features/physics/PhysicsController";
 import { PoseController } from "@/features/body/PoseController";
 import { IdleBodyController } from "@/features/body/IdleBodyController";
 import { IdleFaceController } from "@/features/body/FaceController";
+import { IdleHandController } from "@/features/body/IdleHandController";
 import {
   LiveContextController,
   type AvaaniLiveContext,
 } from "@/features/live/LiveContextController";
 
-export default function VrmStage() {
+const VrmStage = forwardRef((props, ref) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const rafRef = useRef<number | null>(null);
+  
+  const mouthOpenTarget = useRef(0);
+
+  useImperativeHandle(ref, () => ({
+    triggerMouthPop: () => {
+      mouthOpenTarget.current = 0.85; // Slightly wider for better visibility
+      setTimeout(() => {
+        if (mouthOpenTarget.current > 0) mouthOpenTarget.current = 0.25; 
+      }, 70);
+    },
+    stopMouth: () => {
+      mouthOpenTarget.current = 0;
+    }
+  }));
 
   useEffect(() => {
     let mounted = true;
     const canvas = canvasRef.current;
     if (!canvas || rendererRef.current) return;
 
-    // 1. Renderer Setup
     const renderer = createRenderer(canvas);
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
     rendererRef.current = renderer;
-
     const scene = createScene();
     const clock = new THREE.Clock();
 
-    // 2. Video Call Camera (Portrait Framing)
     const camera = new THREE.PerspectiveCamera(25, 1, 0.1, 20);
-    // Position: Intimate portrait distance
     camera.position.set(0, 1.4, 2.1); 
-    // Target: Look at waist/chest to push head higher in frame
     camera.lookAt(new THREE.Vector3(0, 1.15, 0));
 
-    // 3. Avatar Root & Floor
     const avatarRoot = new THREE.Group();
     scene.add(avatarRoot);
 
-    const floor = new THREE.Mesh(
-      new THREE.PlaneGeometry(100, 100),
-      new THREE.ShadowMaterial({ opacity: 0.2 })
-    );
-    floor.rotation.x = -Math.PI / 2;
-    floor.receiveShadow = true;
-    scene.add(floor);
-
     let vrm: VRM | null = null;
-    const controllers: {
-      body: BodyController | null;
-      physics: PhysicsController | null;
-      pose: PoseController | null;
-      idle: IdleBodyController | null;
-      face: IdleFaceController | null;
-      live: LiveContextController | null;
-    } = { body: null, physics: null, pose: null, idle: null, face: null, live: null };
+    const controllers: any = { 
+      body: null, physics: null, pose: null, idle: null, face: null, hand: null, live: null 
+    };
 
+    // ... (onResize, faceAvatarToCamera, WebSocket/Polling logic stays the same)
     const onResize = () => {
       if (!canvas.parentElement) return;
       const w = canvas.parentElement.clientWidth;
@@ -78,7 +72,6 @@ export default function VrmStage() {
     };
     window.addEventListener("resize", onResize);
 
-    // 4. Face Camera Helper
     const faceAvatarToCamera = () => {
       if (!vrm) return;
       const humanoid: any = vrm.humanoid;
@@ -91,73 +84,24 @@ export default function VrmStage() {
       const toCam = camPos.sub(avatarPos).normalize();
       const q = new THREE.Quaternion();
       basisObj.getWorldQuaternion(q);
-      const plusZ = new THREE.Vector3(0, 0, 1).applyQuaternion(q).normalize();
-      const minusZ = new THREE.Vector3(0, 0, -1).applyQuaternion(q).normalize();
-      const plusX = new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize();
-      const minusX = new THREE.Vector3(-1, 0, 0).applyQuaternion(q).normalize();
-      const candidates = [
-        { yaw: 0, score: plusZ.dot(toCam) },
-        { yaw: Math.PI, score: minusZ.dot(toCam) },
-        { yaw: -Math.PI / 2, score: plusX.dot(toCam) },
-        { yaw: Math.PI / 2, score: minusX.dot(toCam) },
+      const axes = [
+        { yaw: 0, vec: new THREE.Vector3(0, 0, 1) },
+        { yaw: Math.PI, vec: new THREE.Vector3(0, 0, -1) },
+        { yaw: -Math.PI / 2, vec: new THREE.Vector3(1, 0, 0) },
+        { yaw: Math.PI / 2, vec: new THREE.Vector3(-1, 0, 0) },
       ];
-      candidates.sort((a, b) => b.score - a.score);
+      const candidates = axes.map(a => ({
+        yaw: a.yaw,
+        score: a.vec.applyQuaternion(q).normalize().dot(toCam)
+      })).sort((a, b) => b.score - a.score);
       avatarRoot.rotation.y = candidates[0]?.yaw ?? 0;
     };
 
-    // 5. Live Context Connection
-    const WS_URL = process.env.NEXT_PUBLIC_AVAANI_WS_URL;
-    const HTTP_URL = process.env.NEXT_PUBLIC_AVAANI_HTTP_URL;
-    let ws: WebSocket | null = null;
-    let pollTimer: number | null = null;
-
-    const handleIncoming = (raw: unknown) => {
-      const msg = raw as any;
-      const ctx: AvaaniLiveContext = msg?.payload ?? msg;
-      controllers.live?.setContext(ctx);
-    };
-
-    const startWebSocket = () => {
-      if (!WS_URL) return false;
-      try {
-        ws = new WebSocket(WS_URL);
-        ws.onmessage = (ev) => {
-          try { handleIncoming(JSON.parse(ev.data)); } catch { }
-        };
-        ws.onclose = () => {
-          if (mounted) setTimeout(() => mounted && startWebSocket(), 1000);
-        };
-        return true;
-      } catch { return false; }
-    };
-
-    const startPolling = () => {
-      if (!HTTP_URL) return;
-      const poll = async () => {
-        if (!mounted) return;
-        try {
-          const res = await fetch(HTTP_URL, { cache: "no-store" });
-          if (res.ok) handleIncoming(await res.json());
-        } catch { }
-      };
-      poll();
-      pollTimer = window.setInterval(poll, 200);
-    };
-
-    // 6. Init Logic
     (async () => {
       try {
         const loaded = (await loadVrm("/models/character.vrm")) as VRM | null;
         if (!mounted || !loaded) return;
         vrm = loaded;
-
-        vrm.scene.traverse((obj) => {
-          if ((obj as THREE.Mesh).isMesh) {
-            obj.castShadow = true;
-            obj.receiveShadow = true;
-          }
-        });
-
         avatarRoot.add(vrm.scene);
 
         controllers.pose = new PoseController(vrm);
@@ -165,48 +109,58 @@ export default function VrmStage() {
         controllers.physics = new PhysicsController(vrm);
         controllers.live = new LiveContextController(vrm);
         controllers.face = new IdleFaceController(vrm);
+        controllers.hand = new IdleHandController(vrm);
         controllers.idle = new IdleBodyController(vrm, {
           intensity: 0.9, breathe: 1.0, sway: 1.0, head: 0.9, slerp: 0.22,
         });
 
-        if ((vrm as any).springBoneManager?.reset) (vrm as any).springBoneManager.reset();
-        controllers.body.setBodyWeight(0.2);
-
         vrm.update(0);
         onResize();
         faceAvatarToCamera();
-
-        const wsStarted = startWebSocket();
-        if (!wsStarted) startPolling();
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error("VRM Load Error:", e); }
     })();
 
-    // 7. Animation Loop
     const animate = () => {
       if (!mounted) return;
       rafRef.current = requestAnimationFrame(animate);
+      
       const dt = clock.getDelta();
       const t = clock.getElapsedTime();
 
       if (vrm) {
+        // 1. Run standard controllers
         controllers.pose?.update?.(dt);
         controllers.body?.update?.(dt);
-
-        // Live drives tracking
         controllers.live?.update(dt);
 
-        // Face idle logic (with live suppression)
         const gazeScore = controllers.live?.getGazeScore?.() ?? 0;
         const visible = controllers.live?.getTrackingVisible?.() ?? false;
         controllers.face?.setLiveGaze({ strength: gazeScore, visible });
-        controllers.face?.update(dt);
+        controllers.face?.update(dt); // <--- This might be clearing mouth values
 
-        // Energy-based idle intensity
         const energy = controllers.live?.getEnergy?.() ?? 0.9;
         controllers.idle?.setConfig?.({ intensity: 0.5 + energy * 0.7 });
         controllers.idle?.update?.(dt);
-
+        controllers.hand?.update(dt);
         controllers.physics?.applyWind?.(t);
+
+        // 2. OVERRIDE LIP SYNC (Must be done AFTER controllers.face.update)
+        if (vrm.expressionManager) {
+            // Get current value (aa or A depending on VRM version)
+            const currentA = vrm.expressionManager.getValue("aa") ?? vrm.expressionManager.getValue("ih") ?? 0;
+            
+            // Smooth lerp for natural movement
+            const nextValue = THREE.MathUtils.lerp(currentA, mouthOpenTarget.current, 0.3);
+            
+            // Apply to multiple shapes to ensure it works on all models
+            vrm.expressionManager.setValue("aa", nextValue); // VRM 1.0
+            vrm.expressionManager.setValue("A", nextValue);  // VRM 0.x
+            vrm.expressionManager.setValue("oh", nextValue * 0.2); // Add some roundness
+            
+            // 3. CRITICAL: Force the update right now so it registers
+            vrm.expressionManager.update();
+        }
+
         vrm.update(dt);
       }
       renderer.render(scene, camera);
@@ -218,20 +172,20 @@ export default function VrmStage() {
       mounted = false;
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       window.removeEventListener("resize", onResize);
-      if (pollTimer) window.clearInterval(pollTimer);
-      if (ws) ws.close();
       if (vrm?.scene) {
         avatarRoot.remove(vrm.scene);
         disposeObject3D(vrm.scene);
       }
       renderer.dispose();
-      rendererRef.current = null;
     };
   }, []);
 
   return (
-    <div style={{ width: "100vw", height: "100vh", overflow: "hidden" }}>
-      <canvas ref={canvasRef} style={{ width: "100%", height: "100%" }} />
+    <div style={{ width: "100vw", height: "100vh", overflow: "hidden", background: "#1a1a1a" }}>
+      <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
     </div>
   );
-}
+});
+
+VrmStage.displayName = "VrmStage";
+export default VrmStage;

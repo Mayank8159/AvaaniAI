@@ -30,33 +30,28 @@ export class BodyController {
     const humanoid = this.vrm.humanoid;
     if (!humanoid) return;
 
-    const hips =
-      humanoid.getRawBone("hips" as any)?.node ??
-      humanoid.getRawBone("Hips" as any)?.node;
+    // Use the built-in VRMHumanBoneName enum for type safety if available
+    const bones = {
+      hips: humanoid.getNormalizedBoneNode("hips"),
+      spine: humanoid.getNormalizedBoneNode("spine"),
+      chest: humanoid.getNormalizedBoneNode("chest"),
+      upperLeft: humanoid.getNormalizedBoneNode("leftUpperLeg"),
+      upperRight: humanoid.getNormalizedBoneNode("rightUpperLeg"),
+      // Adding neck helps the transition to the head look natural
+      neck: humanoid.getNormalizedBoneNode("neck")
+    };
 
-    const spine =
-      humanoid.getRawBone("spine" as any)?.node ??
-      humanoid.getRawBone("Spine" as any)?.node;
+    const scale = 1 + w * 0.25;
 
-    const chest =
-      humanoid.getRawBone("chest" as any)?.node ??
-      humanoid.getRawBone("Chest" as any)?.node;
+    // Apply scales with slight "tapering" as we move up the spine
+    if (bones.hips) bones.hips.scale.set(scale, 1, scale);
+    if (bones.spine) bones.spine.scale.set(scale * 0.95, 1, scale * 0.95);
+    if (bones.chest) bones.chest.scale.set(scale * 0.9, 1, scale * 0.9);
+    if (bones.neck) bones.neck.scale.set(1 + (w * 0.1), 1, 1 + (w * 0.1));
 
-    const leftUpperLeg =
-      humanoid.getRawBone("leftUpperLeg" as any)?.node ??
-      humanoid.getRawBone("LeftUpperLeg" as any)?.node;
-
-    const rightUpperLeg =
-      humanoid.getRawBone("rightUpperLeg" as any)?.node ??
-      humanoid.getRawBone("RightUpperLeg" as any)?.node;
-
-    const scale = 1 + w * 0.25; // 25% wider at max
-
-    if (hips) hips.scale.set(scale, 1, scale);
-    if (spine) spine.scale.set(scale * 0.9, 1, scale * 0.9);
-    if (chest) chest.scale.set(scale * 0.85, 1, scale * 0.85);
-
-    if (leftUpperLeg) leftUpperLeg.scale.set(scale * 0.95, 1, scale * 0.95);
-    if (rightUpperLeg) rightUpperLeg.scale.set(scale * 0.95, 1, scale * 0.95);
+    // Legs usually need to stay relatively thick to support the wider hips
+    const legScale = 1 + w * 0.15;
+    if (bones.upperLeft) bones.upperLeft.scale.set(legScale, 1, legScale);
+    if (bones.upperRight) bones.upperRight.scale.set(legScale, 1, legScale);
   }
 }
