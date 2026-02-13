@@ -5,7 +5,8 @@ import numpy as np
 import face_recognition
 from PIL import Image, UnidentifiedImageError
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
+from typing import List
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -13,19 +14,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ==========================================
-# CONFIGURATION & SETUP
+# CONFIGURATION
 # ==========================================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-# CRITICAL: Use Service Role Key for Admin privileges (Face Scan/User Management)
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") 
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") # Service Role Key needed!
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("❌ CRITICAL: Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env")
 
-# Initialize Admin Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Create API Router
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 # ==========================================
@@ -45,200 +42,181 @@ def validate_username(username: str):
 
 async def check_username_availability(username: str):
     """
-    Checks if username already exists in Supabase Profiles.
+    Checks if username exists in the 'profiles' table.
     """
     try:
+        # We query the profiles table which is public/accessible via service key
         response = supabase.table("profiles").select("username").eq("username", username).execute()
-        if response.data:
+        if response.data and len(response.data) > 0:
             raise HTTPException(status_code=409, detail=f"Username '{username}' is already taken.")
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"⚠️ DB Check Error: {e}")
-        # Proceed cautiously if DB check fails, SQL constraint will catch it later.
+        print(f"⚠️ DB Check Warning: {e}")
 
 # ==========================================
-# 1. SIGNUP + FACE REGISTRATION (Atomic)
+# 1. USERNAME SIGNUP + BIOMETRIC REGISTRATION
 # ==========================================
 @router.post("/signup", status_code=201)
 async def signup(
-    email: EmailStr = Form(...),
+    username: str = Form(...),  # <--- Primary ID
     password: str = Form(..., min_length=6),
-    username: str = Form(...),
     full_name: str = Form(...),
-    image: UploadFile = File(...)
+    images: List[UploadFile] = File(...) # Multi-Angle Images
 ):
     """
-    Production Signup Flow:
-    1. Validate Input (Username format & uniqueness).
-    2. Process Face (Ensure 1 face exists).
-    3. Create User in Auth.
-    4. Upload Avatar & Save Face Data.
-    5. Rollback (Delete User) if step 4 fails.
+    Username-Only Signup.
+    1. Checks if username is unique.
+    2. Processes 5 face angles -> Average Vector.
+    3. Creates User (using hidden 'username@avaani.app' email).
+    4. Saves images & profile.
     """
-    print(f"📝 Starting Signup for: {email} ({username})")
+    print(f"📝 Starting Registration for User: {username}")
 
     # --- STEP 1: VALIDATION ---
     username = validate_username(username)
     await check_username_availability(username)
 
-    # --- STEP 2: FACE PROCESSING (Fail Early) ---
-    face_vector = None
-    image_bytes = None
-    
-    try:
-        # Read file into memory
-        image_bytes = await image.read()
-        
-        # Convert to Image object
+    # --- STEP 2: FACE PROCESSING (Multi-Angle) ---
+    valid_encodings = []
+    processed_images_data = [] 
+
+    if len(images) < 3:
+        raise HTTPException(status_code=400, detail="Please provide at least 3 face angles.")
+
+    print(f"   Processing {len(images)} images...")
+
+    for idx, img_file in enumerate(images):
         try:
-            pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except UnidentifiedImageError:
-            raise HTTPException(status_code=400, detail="Invalid image file format.")
+            content = await img_file.read()
+            processed_images_data.append(content)
             
-        np_image = np.array(pil_image)
-        
-        # Scan for faces (HOG is faster, CNN is more accurate but requires GPU)
-        # Using HOG for CPU production safety
-        face_locations = face_recognition.face_locations(np_image, model="hog")
-        
-        if len(face_locations) == 0:
-            raise HTTPException(status_code=400, detail="❌ No face detected. Please ensure good lighting and look at the camera.")
-        
-        if len(face_locations) > 1:
-            raise HTTPException(status_code=400, detail="❌ Multiple faces detected. Registration requires a solo photo.")
+            pil_image = Image.open(io.BytesIO(content)).convert("RGB")
+            np_image = np.array(pil_image)
+            
+            # Using HOG for speed. (Use 'cnn' if you have GPU and dlib installed)
+            face_locations = face_recognition.face_locations(np_image, model="hog")
+            
+            if len(face_locations) == 1:
+                encoding = face_recognition.face_encodings(np_image, face_locations)[0]
+                valid_encodings.append(encoding)
+            else:
+                print(f"   ⚠️ Image {idx}: Skipped (Face unclear/multiple).")
 
-        # Generate Encoding
-        encodings = face_recognition.face_encodings(np_image, face_locations)
-        face_vector = encodings[0].tolist()
-        
-        print("✅ Face Validated.")
+        except Exception as e:
+            print(f"   ❌ Error Image {idx}: {e}")
 
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f"❌ Face Logic Error: {e}")
-        raise HTTPException(status_code=500, detail="Server error processing face data.")
+    if len(valid_encodings) < 3:
+        raise HTTPException(status_code=400, detail="Could not detect a clear face in at least 3 photos.")
 
-    # --- STEP 3: CREATE USER (Auth) ---
+    # Average the vectors for stability
+    avg_encoding = np.mean(valid_encodings, axis=0).tolist()
+    print(f"✅ Generated Master Face Profile.")
+
+    # --- STEP 3: CREATE USER (Ghost Email Strategy) ---
     user_id = None
+    # We construct a fake email because Supabase Auth requires one.
+    # The user never sees this.
+    ghost_email = f"{username}@avaani.app"
+
     try:
-        # We use Admin API to create user to verify email availability immediately
-        # (Standard sign_up also works, but admin gives more control)
         attributes = {
-            "email": email,
+            "email": ghost_email,
             "password": password,
-            "email_confirm": True, # Auto-confirm for smoother UX (Optional)
+            "email_confirm": True, # Auto-confirm so they can login immediately
             "user_metadata": {
                 "username": username,
                 "full_name": full_name
             }
         }
         
-        # Create User via Admin Client
         user_response = supabase.auth.admin.create_user(attributes)
         user_id = user_response.user.id
         print(f"✅ User Created: {user_id}")
 
     except Exception as e:
-        # Supabase returns specific error messages usually
         print(f"❌ Auth Creation Error: {e}")
+        # If fake email exists, it means username is technically taken in Auth
         if "already registered" in str(e).lower():
-             raise HTTPException(status_code=409, detail="Email is already registered.")
-        raise HTTPException(status_code=400, detail="Could not create user account.")
+             raise HTTPException(status_code=409, detail="Username is unavailable.")
+        raise HTTPException(status_code=400, detail="Registration failed.")
 
-    # --- STEP 4: SAVE DATA (Atomic Transaction Simulation) ---
+    # --- STEP 4: SAVE IMAGES & PROFILE ---
     try:
-        # A. Upload Image
-        file_ext = "jpg" # We converted to RGB, so we can save as jpg safely
-        file_path = f"{user_id}/avatar.{file_ext}"
+        main_avatar_url = ""
         
-        supabase.storage.from_("faces").upload(
-            file=image_bytes,
-            path=file_path,
-            file_options={"content-type": "image/jpeg", "upsert": "true"}
-        )
-        
-        public_url = supabase.storage.from_("faces").get_public_url(file_path)
-        
-        # B. Update Profile
-        # The profile row was auto-created by the SQL trigger. We just update the null fields.
+        for i, img_bytes in enumerate(processed_images_data):
+            file_path = f"{user_id}/pose_{i}.jpg"
+            # Upload to 'faces' bucket
+            supabase.storage.from_("faces").upload(
+                file=img_bytes, path=file_path, file_options={"content-type": "image/jpeg", "upsert": "true"}
+            )
+            if i == 0:
+                main_avatar_url = supabase.storage.from_("faces").get_public_url(file_path)
+
+        # Update Profile (Row already created by Trigger)
         update_data = {
-            "face_encoding": face_vector,
-            "avatar_url": public_url
+            "face_encoding": avg_encoding,
+            "avatar_url": main_avatar_url
         }
+        supabase.table("profiles").update(update_data).eq("id", user_id).execute()
         
-        data = supabase.table("profiles").update(update_data).eq("id", user_id).execute()
-        
-        print(f"✅ Registration Complete for {username}")
+        print(f"✅ Profile Complete: {username}")
         
         return {
             "status": "success",
-            "message": "User registered successfully",
-            "user": {
-                "id": user_id,
-                "username": username,
-                "avatar_url": public_url
-            }
+            "message": "User registered.",
+            "user": {"id": user_id, "username": username, "avatar_url": main_avatar_url}
         }
 
     except Exception as e:
-        print(f"❌ Critical Save Error: {e}")
-        
-        # --- ROLLBACK PROTOCOL ---
-        # If saving the face fails, we MUST delete the Auth User, 
-        # otherwise they can login but face recognition will crash.
-        if user_id:
-            print(f"⚠️ Rolling back: Deleting user {user_id}...")
-            supabase.auth.admin.delete_user(user_id)
-            
-        raise HTTPException(status_code=500, detail="Account creation failed during data save. Please try again.")
+        print(f"❌ Save Error: {e}")
+        if user_id: supabase.auth.admin.delete_user(user_id) # Rollback
+        raise HTTPException(status_code=500, detail="Registration failed during save.")
 
 # ==========================================
-# 2. LOGIN (Standard)
+# 2. USERNAME LOGIN
 # ==========================================
 class LoginSchema(BaseModel):
-    email: EmailStr
+    username: str
     password: str
 
 @router.post("/login")
 async def login(credentials: LoginSchema):
     """
-    Standard Email/Password Login.
-    Returns Access Token for WebSocket.
+    Logs in using Username + Password.
+    (Internally converts username -> username@avaani.app)
     """
     try:
+        # Reconstruct the ghost email
+        ghost_email = f"{credentials.username.lower().strip()}@avaani.app"
+        
         response = supabase.auth.sign_in_with_password({
-            "email": credentials.email,
+            "email": ghost_email,
             "password": credentials.password
         })
         
         if not response.session:
-            raise HTTPException(status_code=401, detail="Invalid credentials.")
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
             
         return {
             "status": "success",
             "access_token": response.session.access_token,
-            "refresh_token": response.session.refresh_token,
             "user": {
                 "id": response.user.id,
-                "email": response.user.email,
                 "username": response.user.user_metadata.get("username")
             }
         }
 
     except Exception as e:
         print(f"❌ Login Failed: {e}")
-        raise HTTPException(status_code=401, detail="Login failed. Check email and password.")
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 # ==========================================
-# 3. UTILITY: CHECK USERNAME (For Frontend UI)
+# 3. CHECK USERNAME (Public)
 # ==========================================
 @router.get("/check-username/{username}")
 async def check_username(username: str):
-    """
-    API for frontend to show green checkmark if username is free.
-    """
     try:
         clean_user = validate_username(username)
         await check_username_availability(clean_user)
