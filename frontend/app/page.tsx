@@ -15,7 +15,7 @@ export default function Home() {
   const recognitionRef = useRef<any>(null);
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
 
-  // --- 1. VOICE WARMUP ---
+  // 1. Load Voices (Handle Mobile delay)
   useEffect(() => {
     if (typeof window !== "undefined") {
       const synth = window.speechSynthesis;
@@ -25,12 +25,12 @@ export default function Home() {
     }
   }, []);
 
-  // --- 2. CLEAN & SPEAK LOGIC ---
+  // 2. Mobile-Optimized Speech & Lip Sync
   const speakAnimeVoice = useCallback((text: string) => {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
     window.speechSynthesis.cancel();
 
-    // Remove emojis and icons so they aren't read as words
+    // Clean text: remove emojis and bracketed actions
     const cleanText = text
       .replace(/\[.*?\]/g, "") 
       .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "")
@@ -49,18 +49,43 @@ export default function Home() {
       v.name.includes("Samantha") || 
       v.name.includes("Zira")
     );
-
     if (feminineVoice) utterance.voice = feminineVoice;
 
+    // Mobile Fallback Logic
+    let boundaryFired = false;
+    const wordIntervals: NodeJS.Timeout[] = [];
+
     utterance.onboundary = (event) => {
-      if (event.name === 'word') stageRef.current?.triggerMouthPop(); 
+      if (event.name === 'word') {
+        boundaryFired = true; 
+        stageRef.current?.triggerMouthPop(); 
+      }
     };
 
-    utterance.onend = () => stageRef.current?.stopMouth();
+    utterance.onstart = () => {
+      // If no boundary event fires in 150ms, trigger manual pulses (for Mobile)
+      setTimeout(() => {
+        if (!boundaryFired) {
+          const words = cleanText.split(/\s+/);
+          words.forEach((_, index) => {
+            const timer = setTimeout(() => {
+              stageRef.current?.triggerMouthPop();
+            }, index * 320); // Syncs roughly with 0.95 speech rate
+            wordIntervals.push(timer);
+          });
+        }
+      }, 150);
+    };
+
+    utterance.onend = () => {
+      wordIntervals.forEach(clearTimeout);
+      stageRef.current?.stopMouth();
+    };
+
     window.speechSynthesis.speak(utterance);
   }, [availableVoices]);
 
-  // --- 3. SPEECH RECOGNITION ---
+  // 3. Speech Recognition Setup
   useEffect(() => {
     if (typeof window !== "undefined") {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -85,7 +110,7 @@ export default function Home() {
     setIsProcessing(true);
     try {
       const res = await (window as any).puter.ai.chat(
-        `You are a cute, caring anime girl. Use emojis in text but keep response short. Respond to: ${liveSpeech}`,
+        `You are a cute, caring anime girl. Use emojis but stay brief. Respond to: ${liveSpeech}`,
         { model: 'gpt-4o' } 
       );
       const clean = res.message.content.trim();
@@ -101,11 +126,14 @@ export default function Home() {
   return (
     <main className="fixed inset-0 bg-[#0a0a0a] overflow-hidden">
       <Script src="https://js.puter.com/v2/" strategy="afterInteractive" />
-      <div className="absolute inset-0 z-10"><VrmStage ref={stageRef} /></div>
+      
+      <div className="absolute inset-0 z-10">
+        <VrmStage ref={stageRef} />
+      </div>
 
-      <div className={`absolute top-12 left-1/2 -translate-x-1/2 z-30 transition-all duration-500 ${transcript || liveSpeech ? "opacity-100" : "opacity-0"}`}>
-        <div className="bg-pink-900/60 backdrop-blur-xl px-6 py-3 rounded-2xl border border-pink-400/30 text-white text-center shadow-2xl">
-          <p className="text-sm font-medium">{isListening ? liveSpeech : transcript}</p>
+      <div className={`absolute top-12 left-1/2 -translate-x-1/2 z-30 transition-all duration-500 ${transcript || liveSpeech ? "opacity-100 translate-y-0" : "opacity-0 -translate-y-4"}`}>
+        <div className="bg-pink-900/60 backdrop-blur-xl px-6 py-3 rounded-2xl border border-pink-400/30 text-white text-center shadow-2xl max-w-[80vw]">
+          <p className="text-sm font-medium leading-relaxed">{isListening ? liveSpeech : transcript}</p>
         </div>
       </div>
 
@@ -122,7 +150,9 @@ export default function Home() {
               setIsListening(true);
             }
           }}
-          className={`w-20 h-20 rounded-full flex items-center justify-center border-2 transition-all ${isListening ? "bg-rose-500/20 border-rose-400 scale-110 shadow-[0_0_40px_rgba(244,63,94,0.5)]" : "bg-white/5 border-white/10"}`}
+          className={`w-20 h-20 rounded-full flex items-center justify-center border-2 transition-all active:scale-95 ${
+            isListening ? "bg-rose-500/20 border-rose-400 scale-110 shadow-[0_0_40px_rgba(244,63,94,0.5)]" : "bg-white/5 border-white/10"
+          }`}
         >
           {isProcessing ? <Loader2 className="animate-spin text-white" /> : isListening ? <Square className="text-white fill-white" size={20} /> : <Mic className="text-white" size={32} />}
         </button>
