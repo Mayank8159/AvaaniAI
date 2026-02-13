@@ -276,10 +276,10 @@ class VisionSystem:
         self.mp_pose = mp.solutions.pose.Pose(min_detection_confidence=0.5)
         
         try:
-            self.yolo = YOLO("yolov8m.pt") 
+            self.yolo = YOLO("models/yolov8m.pt") 
         except:
             print("⚠️ YOLOv8m not found, downloading...")
-            self.yolo = YOLO("yolov8m.pt")
+            self.yolo = YOLO("models/yolov8m.pt")
         
         # 2. Components
         self.gesture_engine = GestureEngine()

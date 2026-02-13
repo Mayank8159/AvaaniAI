@@ -1,0 +1,22 @@
+# Ignore Secrets
+.env
+keys.json
+secrets.yaml
+
+# Ignore Python Cache (Junk files)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore Large Models (Don't upload 2GB model files to git!)
+models/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore Virtual Environment
+venv/
+env/
+.venv/
