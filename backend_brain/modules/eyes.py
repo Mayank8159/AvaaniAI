@@ -314,14 +314,36 @@ class VisionSystem:
             "_yolo_boxes": [] 
         }
 
-        # 5. Start Async Thread (Fast Interval)
-        self.slow_thread = threading.Thread(target=self._fast_worker, daemon=True)
-        self.slow_thread.start()
+        # 5. Start Async Threads
+        self.yolo_thread = threading.Thread(target=self._yolo_worker, daemon=True)
+        self.identity_thread = threading.Thread(target=self._identity_worker, daemon=True)
+        self.emotion_thread = threading.Thread(target=self._emotion_worker, daemon=True)
+        
+        self.yolo_thread.start()
+        self.identity_thread.start()
+        self.emotion_thread.start()
         print("✅ System Active.")
 
     def start_registration(self, name):
         self.registrar.start(name)
         self.context["system_status"] = "registering"
+
+    def sync_biometrics(self, supabase_client, user_id, username):
+        """Fetches the 5 pose images from the cloud for local matching."""
+        user_dir = os.path.join(self.db_path, username)
+        if not os.path.exists(user_dir): os.makedirs(user_dir)
+        
+        print(f"📡 Syncing Biometrics: {username}...")
+        for i in range(5):
+            try:
+                data = supabase_client.storage.from_("faces").download(f"{user_id}/pose_{i}.jpg")
+                with open(os.path.join(user_dir, f"pose_{i}.jpg"), "wb") as f:
+                    f.write(data)
+            except: continue
+        
+        # Reset DeepFace Index
+        pkl = os.path.join(self.db_path, "representations_vgg_face.pkl")
+        if os.path.exists(pkl): os.remove(pkl)
 
     def process_frame(self, frame):
         h, w, _ = frame.shape
@@ -439,17 +461,35 @@ class VisionSystem:
         with self.lock: self.latest_frame = frame.copy()
         return frame
 
-    def _fast_worker(self):
-        """High-Speed Worker Thread"""
+    def get_context_json(self):
+        """Returns the current context as a JSON-compatible dictionary"""
+        return {
+            "identity": self.context["identity"],
+            "emotion": self.context["emotion"],
+            "emotion_intensity": self.context["emotion_intensity"],
+            "emotion_probs": self.context["emotion_probs"],
+            "state_confidence": self.context["state_confidence"],
+            "energy_level": self.context["energy_level"],
+            "attention": self.context["attention"],
+            "engagement": self.context["engagement"],
+            "gaze": self.context["gaze"],
+            "tracking": self.context["tracking"],
+            "posture": self.context["posture"],
+            "gestures": self.context["gestures"],
+            "holding": self.context["holding"],
+            "surroundings": self.context["surroundings"],
+            "timestamp": self.context["timestamp"],
+            "system_status": self.context["system_status"]
+        }
+
+    def _yolo_worker(self):
+        """Dedicated YOLO Detection Thread"""
         while self.running:
             if self.latest_frame is None: 
                 time.sleep(0.01); continue
             
             with self.lock: frame = self.latest_frame.copy()
-            metrics = getattr(self, '_current_metrics', {})
-            landmarks = getattr(self, '_current_landmarks', None)
 
-            # YOLO - Run as fast as possible
             try:
                 results = self.yolo(frame, verbose=False, conf=0.5)
                 boxes = []
@@ -466,36 +506,61 @@ class VisionSystem:
                 self.context["_yolo_boxes"] = boxes
             except: pass
 
-            # DeepFace
-            if landmarks: 
-                try:
-                    analysis = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False, silent=True)
-                    emo_res = self.emotion_engine.process(
-                        analysis, 
-                        metrics.get('gaze', 0.5), 
-                        metrics.get('posture', {}), 
-                        metrics.get('attention', 0.5),
-                        landmarks
-                    )
-                    
-                    self.context["emotion"] = emo_res['dominant']
-                    self.context["emotion_intensity"] = emo_res['intensity']
-                    self.context["state_confidence"] = emo_res['confidence']
-                    self.context["energy_level"] = emo_res['energy']
-                    self.context["emotion_probs"] = emo_res['probabilities']
-                    
-                    # Identity Check (Every 1s)
-                    if int(time.time()) % 2 == 0:
-                        identities = DeepFace.find(frame, db_path="known_faces", enforce_detection=False, silent=True)
-                        if identities and len(identities[0]) > 0:
-                            path = identities[0]['identity'][0]
-                            self.context["identity"] = os.path.basename(os.path.dirname(path))
-                        else:
-                            self.context["identity"] = "Unknown"
-                except Exception: pass
+            time.sleep(0.033)  # ~30 FPS
 
-            self.context["timestamp"] = time.time()
-            time.sleep(0.05) # Min sleep to allow UI update
+    def _identity_worker(self):
+        """Dedicated Identity Recognition Thread"""
+        last_identity_check = 0
+        while self.running:
+            if self.latest_frame is None or self._current_landmarks is None:
+                time.sleep(0.05); continue
+            
+            # Only run identity check every 2 seconds
+            if time.time() - last_identity_check < 2:
+                time.sleep(0.05); continue
+                
+            with self.lock: frame = self.latest_frame.copy()
+            last_identity_check = time.time()
+            
+            try:
+                identities = DeepFace.find(frame, db_path="known_faces", enforce_detection=False, silent=True)
+                if identities and len(identities[0]) > 0:
+                    path = identities[0]['identity'][0]
+                    self.context["identity"] = os.path.basename(os.path.dirname(path))
+                else:
+                    self.context["identity"] = "Stranger"
+            except Exception: pass
+
+            time.sleep(0.05)
+
+    def _emotion_worker(self):
+        """Dedicated Emotion Analysis Thread"""
+        while self.running:
+            if self.latest_frame is None or self._current_landmarks is None:
+                time.sleep(0.05); continue
+                
+            with self.lock: frame = self.latest_frame.copy()
+            metrics = getattr(self, '_current_metrics', {})
+            landmarks = self._current_landmarks
+
+            try:
+                analysis = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False, silent=True)
+                emo_res = self.emotion_engine.process(
+                    analysis, 
+                    metrics.get('gaze', 0.5), 
+                    metrics.get('posture', {}), 
+                    metrics.get('attention', 0.5),
+                    landmarks
+                )
+                
+                self.context["emotion"] = emo_res['dominant']
+                self.context["emotion_intensity"] = emo_res['intensity']
+                self.context["state_confidence"] = emo_res['confidence']
+                self.context["energy_level"] = emo_res['energy']
+                self.context["emotion_probs"] = emo_res['probabilities']
+            except Exception: pass
+
+            time.sleep(0.05)  # ~20 FPS for emotion
 
     def stop(self):
         self.running = False

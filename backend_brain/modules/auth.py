@@ -2,13 +2,16 @@ import os
 import io
 import re
 import numpy as np
-import face_recognition
-from PIL import Image, UnidentifiedImageError
+import cv2
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, status
 from pydantic import BaseModel
 from typing import List
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import asyncio
+import threading
+import time
+from enum import Enum
 
 # 1. Load Environment Variables
 load_dotenv()
@@ -17,13 +20,130 @@ load_dotenv()
 # CONFIGURATION
 # ==========================================
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") # Service Role Key needed!
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("❌ CRITICAL: Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env")
+    raise ValueError("❌ CRITICAL: Missing Supabase Credentials in .env")
 
+# Initialize Admin Client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+# Load OpenCV Face Detector (Haar Cascade)
+# This checks "Is there a face?" without needing heavy ML libraries
+try:
+    FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+except Exception as e:
+    print(f"⚠️ Warning: Could not load Haar Cascade. Face validation might fail. {e}")
+
+class FacePose(Enum):
+    FRONT = "front"
+    LEFT = "left"
+    RIGHT = "right"
+    UP = "up"
+    DOWN = "down"
+
+# Global variable to store captured face images
+captured_faces = {}
+capture_lock = threading.Lock()
+
+# ==========================================
+# CAMERA CAPTURE FUNCTIONS
+# ==========================================
+def capture_face_poses():
+    """
+    Opens camera and guides user to capture different face poses
+    """
+    global captured_faces
+    
+    # Initialize video capture
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise HTTPException(status_code=500, detail="Could not access camera")
+    
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    
+    required_poses = [FacePose.FRONT, FacePose.LEFT, FacePose.RIGHT, FacePose.UP, FacePose.DOWN]
+    captured_faces = {}
+    
+    print("📸 Camera opened. Follow the instructions to capture your face from different angles...")
+    
+    for pose in required_poses:
+        print(f"\n🎯 Position: {pose.value.upper()}")
+        print(f"👉 Please turn your face to the {pose.value}")
+        print("Press SPACEBAR when ready...")
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Display current frame with instructions
+            display_frame = frame.copy()
+            
+            # Detect face in current frame
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = FACE_CASCADE.detectMultiScale(gray, 1.3, 5)
+            
+            # Draw rectangle around detected face
+            for (x, y, w, h) in faces:
+                cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            
+            # Add instructions text
+            cv2.putText(display_frame, f"Position: {pose.value.upper()}", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(display_frame, "Press SPACEBAR when ready", 
+                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            if len(faces) > 0:
+                cv2.putText(display_frame, "Face detected! Ready to capture", 
+                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            cv2.imshow('Face Capture', display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord(' '):  # Spacebar pressed
+                if len(faces) > 0:
+                    # Capture the frame with face
+                    with capture_lock:
+                        captured_faces[pose.value] = frame.copy()
+                    print(f"✅ Captured {pose.value} position")
+                    break
+                else:
+                    print("⚠️ No face detected. Please position your face in the frame.")
+            
+            elif key == ord('q'):
+                cap.release()
+                cv2.destroyAllWindows()
+                raise HTTPException(status_code=400, detail="Face capture cancelled by user")
+        
+        # Brief pause before next pose
+        time.sleep(0.5)
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    # Validate that we have all required poses
+    if len(captured_faces) != len(required_poses):
+        missing = set([p.value for p in required_poses]) - set(captured_faces.keys())
+        raise HTTPException(status_code=400, detail=f"Missing captures for positions: {missing}")
+    
+    print(f"✅ Successfully captured {len(captured_faces)} face poses")
+    return list(captured_faces.values())
+
+def convert_frames_to_bytes(frames):
+    """
+    Convert captured frames to bytes for storage
+    """
+    byte_images = []
+    for i, frame in enumerate(frames):
+        # Encode frame to JPEG
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        byte_image = buffer.tobytes()
+        byte_images.append(byte_image)
+    return byte_images
 
 # ==========================================
 # UTILITIES
@@ -45,7 +165,6 @@ async def check_username_availability(username: str):
     Checks if username exists in the 'profiles' table.
     """
     try:
-        # We query the profiles table which is public/accessible via service key
         response = supabase.table("profiles").select("username").eq("username", username).execute()
         if response.data and len(response.data) > 0:
             raise HTTPException(status_code=409, detail=f"Username '{username}' is already taken.")
@@ -55,75 +174,52 @@ async def check_username_availability(username: str):
         print(f"⚠️ DB Check Warning: {e}")
 
 # ==========================================
-# 1. USERNAME SIGNUP + BIOMETRIC REGISTRATION
+# 1. SIGNUP API (With Camera Face Capture)
 # ==========================================
 @router.post("/signup", status_code=201)
 async def signup(
-    username: str = Form(...),  # <--- Primary ID
+    username: str = Form(...),
     password: str = Form(..., min_length=6),
-    full_name: str = Form(...),
-    images: List[UploadFile] = File(...) # Multi-Angle Images
+    full_name: str = Form(...)
 ):
     """
-    Username-Only Signup.
-    1. Checks if username is unique.
-    2. Processes 5 face angles -> Average Vector.
-    3. Creates User (using hidden 'username@avaani.app' email).
-    4. Saves images & profile.
+    1. Validates Username.
+    2. Opens camera and guides user to capture face from different angles.
+    3. Creates User in Supabase.
+    4. Uploads captured face images to Storage for future model training/matching.
     """
-    print(f"📝 Starting Registration for User: {username}")
+    print(f"📝 Starting Registration: {username}")
 
     # --- STEP 1: VALIDATION ---
     username = validate_username(username)
     await check_username_availability(username)
 
-    # --- STEP 2: FACE PROCESSING (Multi-Angle) ---
-    valid_encodings = []
-    processed_images_data = [] 
+    # --- STEP 2: CAPTURE FACE IMAGES FROM CAMERA ---
+    print("📸 Opening camera for face capture...")
+    try:
+        captured_frames = capture_face_poses()
+        print(f"✅ Captured {len(captured_frames)} face images from camera")
+    except Exception as e:
+        print(f"❌ Face capture failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Face capture failed: {str(e)}")
 
-    if len(images) < 3:
-        raise HTTPException(status_code=400, detail="Please provide at least 3 face angles.")
+    # --- STEP 3: CONVERT FRAMES TO BYTES ---
+    try:
+        valid_images_data = convert_frames_to_bytes(captured_frames)
+        print(f"✅ Converted {len(valid_images_data)} frames to byte format")
+    except Exception as e:
+        print(f"❌ Frame conversion error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process captured images")
 
-    print(f"   Processing {len(images)} images...")
-
-    for idx, img_file in enumerate(images):
-        try:
-            content = await img_file.read()
-            processed_images_data.append(content)
-            
-            pil_image = Image.open(io.BytesIO(content)).convert("RGB")
-            np_image = np.array(pil_image)
-            
-            # Using HOG for speed. (Use 'cnn' if you have GPU and dlib installed)
-            face_locations = face_recognition.face_locations(np_image, model="hog")
-            
-            if len(face_locations) == 1:
-                encoding = face_recognition.face_encodings(np_image, face_locations)[0]
-                valid_encodings.append(encoding)
-            else:
-                print(f"   ⚠️ Image {idx}: Skipped (Face unclear/multiple).")
-
-        except Exception as e:
-            print(f"   ❌ Error Image {idx}: {e}")
-
-    if len(valid_encodings) < 3:
-        raise HTTPException(status_code=400, detail="Could not detect a clear face in at least 3 photos.")
-
-    # Average the vectors for stability
-    avg_encoding = np.mean(valid_encodings, axis=0).tolist()
-    print(f"✅ Generated Master Face Profile.")
-
-    # --- STEP 3: CREATE USER (Ghost Email Strategy) ---
+    # --- STEP 4: CREATE SUPABASE USER ---
     user_id = None
-    # We construct a fake email because Supabase Auth requires one.
-    # The user never sees this.
     ghost_email = f"{username}@avaani.app"
 
     try:
         attributes = {
             "email": ghost_email,
             "password": password,
-            "email_confirm": True, # Auto-confirm so they can login immediately
+            "email_confirm": True,
             "user_metadata": {
                 "username": username,
                 "full_name": full_name
@@ -136,46 +232,54 @@ async def signup(
 
     except Exception as e:
         print(f"❌ Auth Creation Error: {e}")
-        # If fake email exists, it means username is technically taken in Auth
         if "already registered" in str(e).lower():
              raise HTTPException(status_code=409, detail="Username is unavailable.")
-        raise HTTPException(status_code=400, detail="Registration failed.")
+        raise HTTPException(status_code=400, detail="User creation failed.")
 
-    # --- STEP 4: SAVE IMAGES & PROFILE ---
+    # --- STEP 5: UPLOAD ALL CAPTURED IMAGES ---
     try:
         main_avatar_url = ""
         
-        for i, img_bytes in enumerate(processed_images_data):
+        # Upload images with specific pose naming
+        for i, img_bytes in enumerate(valid_images_data):
             file_path = f"{user_id}/pose_{i}.jpg"
-            # Upload to 'faces' bucket
+            
             supabase.storage.from_("faces").upload(
-                file=img_bytes, path=file_path, file_options={"content-type": "image/jpeg", "upsert": "true"}
+                file=img_bytes,
+                path=file_path,
+                file_options={"content-type": "image/jpeg", "upsert": "true"}
             )
+            
             if i == 0:
                 main_avatar_url = supabase.storage.from_("faces").get_public_url(file_path)
 
-        # Update Profile (Row already created by Trigger)
+        # Update Profile
         update_data = {
-            "face_encoding": avg_encoding,
             "avatar_url": main_avatar_url
         }
+        
         supabase.table("profiles").update(update_data).eq("id", user_id).execute()
         
-        print(f"✅ Profile Complete: {username}")
+        print(f"✅ Biometric Data Secured: {len(valid_images_data)} reference photos saved.")
         
         return {
             "status": "success",
-            "message": "User registered.",
-            "user": {"id": user_id, "username": username, "avatar_url": main_avatar_url}
+            "message": "User registered successfully.",
+            "user": {
+                "id": user_id,
+                "username": username,
+                "avatar_url": main_avatar_url
+            }
         }
 
     except Exception as e:
         print(f"❌ Save Error: {e}")
-        if user_id: supabase.auth.admin.delete_user(user_id) # Rollback
-        raise HTTPException(status_code=500, detail="Registration failed during save.")
+        if user_id: 
+            supabase.auth.admin.delete_user(user_id)
+        raise HTTPException(status_code=500, detail="Registration failed during image upload.")
 
 # ==========================================
-# 2. USERNAME LOGIN
+# 2. LOGIN API
 # ==========================================
 class LoginSchema(BaseModel):
     username: str
@@ -183,12 +287,7 @@ class LoginSchema(BaseModel):
 
 @router.post("/login")
 async def login(credentials: LoginSchema):
-    """
-    Logs in using Username + Password.
-    (Internally converts username -> username@avaani.app)
-    """
     try:
-        # Reconstruct the ghost email
         ghost_email = f"{credentials.username.lower().strip()}@avaani.app"
         
         response = supabase.auth.sign_in_with_password({
@@ -213,13 +312,98 @@ async def login(credentials: LoginSchema):
         raise HTTPException(status_code=401, detail="Invalid username or password.")
 
 # ==========================================
-# 3. CHECK USERNAME (Public)
+# 3. UTILITY
 # ==========================================
 @router.get("/check-username/{username}")
 async def check_username(username: str):
+    if username == "ping": return {"status": "ok"}
     try:
         clean_user = validate_username(username)
         await check_username_availability(clean_user)
         return {"available": True, "username": clean_user}
     except HTTPException as e:
         return {"available": False, "detail": e.detail}
+
+# ==========================================
+# 4. NEW: FACE SYNC API (Camera-based face capture)
+# ==========================================
+@router.post("/sync-face")
+async def sync_face(
+    username: str = Form(...),
+    password: str = Form(..., min_length=6)
+):
+    """
+    Allows existing users to resync their face data using camera capture
+    """
+    print(f"🔄 Syncing face data for user: {username}")
+    
+    # Authenticate user first
+    ghost_email = f"{username.lower().strip()}@avaani.app"
+    try:
+        response = supabase.auth.sign_in_with_password({
+            "email": ghost_email,
+            "password": password
+        })
+        user_id = response.user.id
+    except Exception as e:
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
+    
+    # Capture new face images
+    print("📸 Opening camera for face sync...")
+    try:
+        captured_frames = capture_face_poses()
+        print(f"✅ Captured {len(captured_frames)} face images for sync")
+    except Exception as e:
+        print(f"❌ Face capture failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Face capture failed: {str(e)}")
+
+    # Convert frames to bytes
+    try:
+        valid_images_data = convert_frames_to_bytes(captured_frames)
+        print(f"✅ Converted {len(valid_images_data)} frames to byte format")
+    except Exception as e:
+        print(f"❌ Frame conversion error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process captured images")
+
+    # Upload new images and replace old ones
+    try:
+        main_avatar_url = ""
+        
+        # Delete old face images first (optional - comment out if you want to keep history)
+        # This would require listing and deleting files in the user's folder
+        
+        # Upload new images
+        for i, img_bytes in enumerate(valid_images_data):
+            file_path = f"{user_id}/pose_{i}.jpg"
+            
+            supabase.storage.from_("faces").upload(
+                file=img_bytes,
+                path=file_path,
+                file_options={"content-type": "image/jpeg", "upsert": "true"}
+            )
+            
+            if i == 0:
+                main_avatar_url = supabase.storage.from_("faces").get_public_url(file_path)
+
+        # Update profile with new avatar URL
+        update_data = {
+            "avatar_url": main_avatar_url
+        }
+        
+        supabase.table("profiles").update(update_data).eq("id", user_id).execute()
+        
+        print(f"✅ Face data synced: {len(valid_images_data)} new reference photos saved.")
+        
+        return {
+            "status": "success",
+            "message": "Face data synced successfully.",
+            "user": {
+                "id": user_id,
+                "username": username,
+                "avatar_url": main_avatar_url
+            }
+        }
+
+    except Exception as e:
+        print(f"❌ Sync Error: {e}")
+        raise HTTPException(status_code=500, detail="Face sync failed during image upload.")

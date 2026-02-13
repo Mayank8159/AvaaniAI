@@ -1,0 +1,50 @@
+{
+  "user": "priyanshu",
+  "vision": {
+    "identity": "Unknown",
+    "emotion": "sad",
+    "emotion_intensity": 0.41,
+    "emotion_probs": {
+      "angry": 0.008,
+      "disgust": 0.0,
+      "happy": 0.0,
+      "sad": 0.403,
+      "surprise": 0.007,
+      "neutral": 0.375,
+      "calm": 0.035,
+      "excited": 0.02,
+      "tired": 0.152
+    },
+    "state_confidence": 0.03,
+    "energy_level": 0.76,
+    "attention": 0.63,
+    "engagement": 0.44,
+    "gaze": {
+      "score": 0.39,
+      "vector": "averted"
+    },
+    "tracking": {
+      "x": 0.744,
+      "y": 0.765,
+      "z": 0.224,
+      "visible": true
+    },
+    "posture": {
+      "inclination": 0.08,
+      "facing_camera": true,
+      "energy": 1.0
+    },
+    "gestures": [],
+    "holding": [],
+    "surroundings": [
+      "person"
+    ],
+    "timestamp": 1770990873.3573058,
+    "system_status": "active"
+  },
+  "audio": {
+    "last_spoken": "",
+    "transcript": ""
+  },
+  "timestamp": 1770990921.4371734
+}
