@@ -9,86 +9,105 @@ from scipy import signal
 # ==========================================
 # CONFIGURATION
 # ==========================================
+# Anchor paths to this file's location
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-# Switch to "base.en" if you downloaded it, otherwise keep distil-small
 MODEL_DIR_NAME = "base.en" 
-MODEL_PATH = os.path.join(CURRENT_DIR, "..", "models", MODEL_DIR_NAME)
+MODEL_PATH = os.path.join(CURRENT_DIR, "../../models", MODEL_DIR_NAME)
 
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8" 
 
 # VAD / Sensitivity
-VAD_THRESHOLD = 0.5              
-SILENCE_LIMIT = 0.8        
-MIN_SPEECH_DURATION = 0.4  
+VAD_THRESHOLD = 0.5               
+SILENCE_LIMIT = 0.8               # Seconds of silence to consider sentence finished
+MIN_SPEECH_DURATION = 0.4         # Minimum speech duration to trigger STT
 
 # DATASETS
-WAKE_VARIANTS = {"avaani", "avani", "avni", "vani", "bonnie", "avane", "honey", "money", "funny"}
-BLACKLIST = {"thank you", "thanks", "subtitles", "copyright", "audio", "video"}
+BLACKLIST = {
+    "thank you", "thanks", "subtitles", "copyright", "audio", "video", 
+    "thanks for watching", "watching", "subscribe"
+}
 
 def strip_punctuation(s):
     return s.translate(str.maketrans('', '', string.punctuation))
 
 class EarSystem:
     def __init__(self):
-        print(f"👂 Initializing Avaani Ears (Stacking Emotion Mode)...")
+        print(f"👂 Initializing Avaani Ears (Server DSP Mode)...")
         
-        # 1. Load VAD
+        # 1. Load VAD (Silero)
         torch.set_num_threads(4) 
-        self.vad_model, utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            force_reload=False,
-            onnx=True 
-        )
-        
+        try:
+            self.vad_model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False,
+                onnx=True,
+                trust_repo=True
+            )
+        except Exception as e:
+            print(f"❌ VAD Load Error: {e}")
+            raise
+
         # 2. Load Whisper
-        if not os.path.exists(MODEL_PATH):
-            raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
+        if os.path.exists(MODEL_PATH):
+            print(f"   - Loading Local Model: {MODEL_PATH}")
+            model_source = MODEL_PATH
+        else:
+            print(f"   - Downloading Model: {MODEL_DIR_NAME}")
+            model_source = MODEL_DIR_NAME
 
         self.stt_model = WhisperModel(
-            model_size_or_path=MODEL_PATH,
+            model_size_or_path=model_source,
             device=DEVICE, 
             compute_type=COMPUTE_TYPE, 
             cpu_threads=4,
-            local_files_only=True
+            local_files_only=os.path.exists(MODEL_PATH)
         )
         
-        # 3. DSP Pipeline (The "Pipe")
-        # 80Hz Highpass removes rumble. 7500Hz Lowpass prevents aliasing.
+        # 3. DSP Pipeline
+        # 80Hz Highpass (rumble), 7500Hz Lowpass (aliasing)
         self.sos = signal.butter(10, [80, 7500], 'bandpass', fs=16000, output='sos')
 
         # 4. State
-        self.audio_buffer = []       
-        self.is_speaking = False     
+        self.audio_buffer = []        
+        self.is_speaking = False      
         self.silence_start_time = None
         self.status = "listening" 
         print("✅ Ears Active.")
 
-    def listen(self, audio_chunk_float32):
+    def process_chunk(self, audio_chunk_float32):
         """
-        Ingests audio chunk. Returns JSON packet if sentence complete.
+        Server API: Ingests audio chunk (numpy float32) from WebSocket.
+        Returns: String (Text) if sentence complete, else None.
         """
         # --- STAGE 1: SIGNAL GATE ---
-        # If signal is incredibly weak (< 1.5%), kill it.
-        # This prevents the "white noise" from being processed.
+        # If signal is incredibly weak (< 1.5%), zero it out (don't delete, keep timing)
         if np.max(np.abs(audio_chunk_float32)) < 0.015:
             audio_chunk_float32[:] = 0.0
 
         # --- STAGE 2: VAD ---
         audio_tensor = torch.tensor(audio_chunk_float32)
-        speech_prob = self.vad_model(audio_tensor, 16000).item()
+        
+        try:
+            speech_prob = self.vad_model(audio_tensor, 16000).item()
+        except:
+            speech_prob = 0.0
+
         current_time = time.time()
         
         if speech_prob > VAD_THRESHOLD:
+            # SPEECH DETECTED
             if not self.is_speaking:
                 self.is_speaking = True
                 self.status = "receiving_speech"
+                # print("   --> [Speech Started]")
             
             self.silence_start_time = None
             self.audio_buffer.extend(audio_chunk_float32)
             
         else:
+            # SILENCE DETECTED
             if self.is_speaking:
                 if self.silence_start_time is None:
                     self.silence_start_time = current_time
@@ -96,37 +115,40 @@ class EarSystem:
                 duration_silent = current_time - self.silence_start_time
                 
                 if duration_silent < SILENCE_LIMIT:
+                    # Allow short pauses (breathing)
                     self.audio_buffer.extend(audio_chunk_float32)
                 else:
-                    # End of sentence
+                    # --- SENTENCE COMPLETED ---
                     self.is_speaking = False
                     self.status = "processing"
                     
-                    # Process
-                    result_packet = self._process_buffer()
+                    # Process the accumulated buffer
+                    transcript = self._process_buffer()
                     
-                    # Reset
+                    # Reset State
                     self.audio_buffer = []
                     self.silence_start_time = None
                     self.status = "listening"
                     
-                    if result_packet:
-                        return result_packet
+                    if transcript:
+                        return transcript
+
         return None
 
     def _process_buffer(self):
-        # Ignore glitches (< 0.4s)
-        if len(self.audio_buffer) < 6400: return None
+        """Filters audio, Boosts Volume, and Transcribes."""
+        # 1. Duration Check (Ignore glitches < 0.4s)
+        if len(self.audio_buffer) < 6400: # 6400 samples = 0.4s at 16k
+            return None
             
         audio_data = np.array(self.audio_buffer, dtype=np.float32)
 
         # --- DSP PIPE ---
         try:
-            # 1. Filter
+            # A. Bandpass Filter
             clean_audio = signal.sosfilt(self.sos, audio_data)
             
-            # 2. Smart Boost
-            # Only boost if we have a healthy signal (> 5% volume)
+            # B. Normalization / Smart Boost
             max_val = np.max(np.abs(clean_audio))
             if max_val > 0.05: 
                 # Target 90% volume (0.9)
@@ -139,7 +161,6 @@ class EarSystem:
 
         # --- TRANSCRIPTION ---
         try:
-            # PROMPT BIASING: Crucial for detecting "Avaani" every time.
             segments, info = self.stt_model.transcribe(
                 audio_data, 
                 beam_size=5, 
@@ -155,29 +176,10 @@ class EarSystem:
             
             # 1. Hallucination Check
             clean_check = strip_punctuation(text.lower())
-            if clean_check in BLACKLIST: return None
+            if clean_check in BLACKLIST: 
+                return None
             
-            # 2. Wake Word Scan
-            # We look for ANY variant in the set WAKE_VARIANTS
-            words = clean_check.split()
-            wake_detected = any(w in WAKE_VARIANTS for w in words)
-            
-            # 3. Construct Packet
-            packet = {
-                "text": text,
-                "wake_word_detected": wake_detected,
-                # If detected, add 30s. If not, add 0s.
-                "timer_add": 30 if wake_detected else 0,
-                "status": "success"
-            }
-            
-            # 4. Fix Text (Optional: Capitalize Avaani for display)
-            if wake_detected:
-                # Simple replacement for display niceness
-                for variant in WAKE_VARIANTS:
-                    packet["text"] = packet["text"].replace(variant, "Avaani").replace(variant.capitalize(), "Avaani")
-                    
-            return packet
+            return text
                 
         except Exception as e:
             print(f"STT Error: {e}")

@@ -4,21 +4,23 @@ import threading
 import time
 import numpy as np
 import os
-import shutil
 import math
 from collections import deque, Counter
 from ultralytics import YOLO
 from deepface import DeepFace
+from deepface.commons import distance as dst # For manual vector comparison
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-
-# 1. HOLDING LOGIC
-HOLDING_LATCH_FRAMES = 15
+HOLDING_LATCH_FRAMES = 12
 IOU_THRESHOLD = 0.15
+EMOTION_TEMPERATURE = 0.65
 
-# 2. ALLOWED CLASSES
+# Identity Thresholds (VGG-Face uses Cosine Similarity)
+# 0.40 is standard, lower is stricter
+IDENTITY_THRESHOLD = 0.40 
+
 ALLOWED_CLASSES_FOR_HOLDING = {
     'backpack', 'handbag', 'suitcase', 'tie', 'cell phone', 'laptop', 'mouse', 
     'remote', 'keyboard', 'book', 'bottle', 'cup', 'fork', 'knife', 'spoon', 
@@ -27,18 +29,10 @@ ALLOWED_CLASSES_FOR_HOLDING = {
     'hair drier', 'toothbrush', 'vase', 'clock', 'pen', 'marker'
 }
 
-# 3. HOME CONTEXT
 HOME_CONTEXT_CLASSES = ALLOWED_CLASSES_FOR_HOLDING.union({
     'person', 'bicycle', 'chair', 'couch', 'potted plant', 'bed', 'dining table', 
     'toilet', 'tv', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator'
 })
-
-# 4. EMOTION CONSTANTS
-EMOTION_TEMPERATURE = 0.65
-
-# 5. REGISTRATION
-REG_HOLD_FRAMES = 10 
-REG_COOLDOWN = 15     
 
 # ==========================================
 # GESTURE ENGINE
@@ -91,93 +85,11 @@ class GestureEngine:
         return 1.0 - min(dist / (palm_width * 1.5), 1.0)
 
 # ==========================================
-# FACE REGISTRAR
-# ==========================================
-class FaceRegistrar:
-    def __init__(self, db_path="known_faces"):
-        self.db_path = db_path
-        if not os.path.exists(db_path): os.makedirs(db_path)
-        self.active = False
-        self.user_name = ""
-        self.stages = ["center", "left", "right", "up", "down"]
-        self.current_stage_idx = 0
-        self.counter = 0
-        self.cooldown = 0
-        self.feedback = ""
-
-    def start(self, name):
-        self.active = True
-        self.user_name = name
-        self.current_stage_idx = 0
-        self.counter = 0
-        self.cooldown = 0
-        user_path = os.path.join(self.db_path, name)
-        if os.path.exists(user_path): shutil.rmtree(user_path) 
-        os.makedirs(user_path)
-        self.feedback = "Look CENTER"
-
-    def process(self, frame, landmarks):
-        if not self.active: return frame, False
-
-        h, w, _ = frame.shape
-        stage = self.stages[self.current_stage_idx]
-        
-        nose = landmarks[1]
-        left_ear = landmarks[234]
-        right_ear = landmarks[454]
-        chin = landmarks[152]
-        forehead = landmarks[10]
-
-        face_width = abs(right_ear.x - left_ear.x)
-        yaw_offset = (nose.x - (left_ear.x + right_ear.x)/2) / face_width * 2
-        face_height = abs(chin.y - forehead.y)
-        pitch_offset = (nose.y - (forehead.y + chin.y)/2) / face_height * 2
-
-        valid_pose = False
-        threshold = 0.25
-
-        if stage == "center": valid_pose = abs(yaw_offset) < 0.15 and abs(pitch_offset) < 0.15
-        elif stage == "left": valid_pose = yaw_offset > threshold
-        elif stage == "right": valid_pose = yaw_offset < -threshold
-        elif stage == "up": valid_pose = pitch_offset < -0.15
-        elif stage == "down": valid_pose = pitch_offset > 0.15
-
-        color = (0, 0, 255)
-        if valid_pose and self.cooldown == 0:
-            self.counter += 1
-            color = (0, 255, 255) 
-            if self.counter >= REG_HOLD_FRAMES:
-                color = (0, 255, 0)
-                path = os.path.join(self.db_path, self.user_name, f"{stage}.jpg")
-                cv2.imwrite(path, frame)
-                self.current_stage_idx += 1
-                self.counter = 0
-                self.cooldown = REG_COOLDOWN
-                
-                if self.current_stage_idx >= len(self.stages):
-                    self.active = False
-                    self.feedback = "Registration Complete!"
-                    cache_path = os.path.join(self.db_path, "representations_vgg_face.pkl")
-                    if os.path.exists(cache_path): os.remove(cache_path)
-                    return frame, True 
-                else:
-                    self.feedback = f"Great! Now Look {self.stages[self.current_stage_idx].upper()}"
-        else:
-            self.counter = 0
-            if self.cooldown > 0: self.cooldown -= 1
-        
-        cv2.putText(frame, f"REGISTERING: {self.feedback}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        bar_width = int((self.counter / REG_HOLD_FRAMES) * 200)
-        cv2.rectangle(frame, (20, 70), (20 + bar_width, 80), color, -1)
-        return frame, False
-
-# ==========================================
 # EMOTION ENGINE
 # ==========================================
 class EmotionEngine:
     def __init__(self):
         self.emotion_history = deque(maxlen=8)
-        self.gaze_history = deque(maxlen=15)
         self.movement_history = deque(maxlen=5) 
         
     def process(self, deepface_result, gaze_score, posture_data, attention_score, face_landmarks):
@@ -199,17 +111,17 @@ class EmotionEngine:
         final_probs = self._temporal_smooth()
         dominant = max(final_probs, key=final_probs.get)
         
-        sorted_probs = sorted(final_probs.values(), reverse=True)
-        state_confidence = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
-        
         entropy = -sum(p * math.log(p + 1e-9) for p in final_probs.values())
         max_entropy = math.log(len(final_probs))
         intensity = 1.0 - (entropy / max_entropy)
 
+        sorted_probs = sorted(final_probs.values(), reverse=True)
+        confidence = sorted_probs[0] - (sorted_probs[1] if len(sorted_probs) > 1 else 0)
+
         return {
             'dominant': dominant,
             'intensity': float(round(intensity, 2)),
-            'confidence': float(round(state_confidence, 2)),
+            'confidence': float(round(confidence, 2)),
             'energy': float(round(energy, 2)),
             'probabilities': {k: float(round(v, 3)) for k, v in final_probs.items()}
         }
@@ -229,9 +141,11 @@ class EmotionEngine:
             kinetic = 0.0
         self.movement_history.append(curr_nose)
         postural = posture_data.get('energy', 0.5)
+        
         left_eye_h = abs(landmarks[159].y - landmarks[145].y) * 100
         right_eye_h = abs(landmarks[386].y - landmarks[374].y) * 100
         facial = np.clip((left_eye_h + right_eye_h) / 2.0, 0.0, 1.0)
+        
         return (kinetic * 0.4) + (postural * 0.3) + (facial * 0.3)
 
     def _derive_states(self, core, gaze, posture, attention, energy):
@@ -264,41 +178,46 @@ class EmotionEngine:
         return smoothed
 
 # ==========================================
-# VISION SYSTEM (OPTIMIZED THREADED)
+# VISION SYSTEM (CORE)
 # ==========================================
 class VisionSystem:
     def __init__(self):
-        print("👁️ Initializing Avaani Vision (YOLOv8m + DeepFace)...")
+        print("👁️ Initializing Avaani Vision (Production Mode)...")
         
-        # 1. Models
+        # 1. Load Mediapipe
         self.mp_face = mp.solutions.face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1)
         self.mp_hands = mp.solutions.hands.Hands(max_num_hands=2, min_detection_confidence=0.5)
         self.mp_pose = mp.solutions.pose.Pose(min_detection_confidence=0.5)
         
+        # 2. Load YOLO
         try:
             self.yolo = YOLO("models/yolov8m.pt") 
         except:
-            print("⚠️ YOLOv8m not found, downloading...")
-            self.yolo = YOLO("models/yolov8m.pt")
+            print("⚠️ Local YOLO model not found, downloading...")
+            self.yolo = YOLO("yolov8m.pt")
         
-        # 2. Components
+        # 3. Engines
         self.gesture_engine = GestureEngine()
         self.emotion_engine = EmotionEngine()
-        self.registrar = FaceRegistrar()
         
-        # 3. State
+        # 4. State
         self.lock = threading.Lock()
         self.running = True
         self.latest_frame = None
         self.collision_counters = {}
         self.latched_objects = set()
+        self._current_landmarks = None
+        self._current_metrics = {}
         
-        # 4. Context Packet
+        # 5. Identity Memory (No Disk Storage)
+        self.active_username = "Stranger"
+        self.known_embeddings = [] # List of vectors
+        
+        # 6. Context Packet
         self.context = {
-            "identity": "Unknown",
+            "identity": "Stranger",
             "emotion": "neutral",
             "emotion_intensity": 0.0,
-            "emotion_probs": {},
             "state_confidence": 0.0,
             "energy_level": 0.5,
             "attention": 0.0,
@@ -310,11 +229,10 @@ class VisionSystem:
             "holding": [],
             "surroundings": [],
             "timestamp": time.time(),
-            "system_status": "active",
-            "_yolo_boxes": [] 
+            "system_status": "active"
         }
 
-        # 5. Start Async Threads
+        # 7. Start Background Workers
         self.yolo_thread = threading.Thread(target=self._yolo_worker, daemon=True)
         self.identity_thread = threading.Thread(target=self._identity_worker, daemon=True)
         self.emotion_thread = threading.Thread(target=self._emotion_worker, daemon=True)
@@ -322,49 +240,59 @@ class VisionSystem:
         self.yolo_thread.start()
         self.identity_thread.start()
         self.emotion_thread.start()
-        print("✅ System Active.")
+        print(f"✅ Vision Active. Mode: In-Memory Verification")
 
-    def start_registration(self, name):
-        self.registrar.start(name)
-        self.context["system_status"] = "registering"
-
-    def sync_biometrics(self, supabase_client, user_id, username):
-        """Fetches the 5 pose images from the cloud for local matching."""
-        user_dir = os.path.join(self.db_path, username)
-        if not os.path.exists(user_dir): os.makedirs(user_dir)
+    def load_user_into_memory(self, supabase_client, user_id, username):
+        """
+        Called by Server.py after login.
+        Downloads reference images, generates embeddings immediately, and stores in RAM.
+        No files are saved to the server disk.
+        """
+        print(f"📡 Downloading Biometrics for: {username}...")
+        embeddings = []
         
-        print(f"📡 Syncing Biometrics: {username}...")
         for i in range(5):
             try:
+                # 1. Download bytes from Supabase
                 data = supabase_client.storage.from_("faces").download(f"{user_id}/pose_{i}.jpg")
-                with open(os.path.join(user_dir, f"pose_{i}.jpg"), "wb") as f:
-                    f.write(data)
-            except: continue
+                
+                # 2. Convert to OpenCV Image
+                nparr = np.frombuffer(data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img is None: continue
+
+                # 3. Generate Embedding (VGG-Face)
+                # enforce_detection=False handles side profiles where face might be partial
+                embedding_obj = DeepFace.represent(
+                    img_path=img, 
+                    model_name="VGG-Face", 
+                    enforce_detection=False
+                )
+                
+                if embedding_obj:
+                    embeddings.append(embedding_obj[0]["embedding"])
+                    
+            except Exception as e:
+                # print(f"⚠️ Failed to process pose_{i}: {e}")
+                continue
         
-        # Reset DeepFace Index
-        pkl = os.path.join(self.db_path, "representations_vgg_face.pkl")
-        if os.path.exists(pkl): os.remove(pkl)
+        # Update State
+        with self.lock:
+            self.known_embeddings = embeddings
+            self.active_username = username
+            
+        print(f"✅ Loaded {len(embeddings)} face vectors for {username} into RAM.")
 
     def process_frame(self, frame):
+        """Main entry point for Server.py"""
         h, w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         
-        # SAFE DEFAULTS
-        gaze_score = 0.0
-        posture_score = 0.0
-        posture_data = {"inclination": 0.0, "facing_camera": False, "energy": 0.5}
-        
         # --- 1. FACE & GAZE ---
         face_res = self.mp_face.process(rgb)
-        lm = None
         if face_res.multi_face_landmarks:
             lm = face_res.multi_face_landmarks[0].landmark
-            
-            if self.registrar.active:
-                frame, done = self.registrar.process(frame, lm)
-                if done: self.context["system_status"] = "active"
-                return frame 
-            
             nose = lm[1]
             eye_dist = np.sqrt((lm[33].x - lm[263].x)**2 + (lm[33].y - lm[263].y)**2)
             z_raw = np.clip(1.0 - (eye_dist * 4.5), 0.0, 1.0)
@@ -379,12 +307,13 @@ class VisionSystem:
 
         # --- 2. POSE ---
         pose_res = self.mp_pose.process(rgb)
+        posture_score = 0.4
+        posture_data = {"inclination": 0.0, "facing_camera": False, "energy": 0.5}
         if pose_res.pose_landmarks:
             plm = pose_res.pose_landmarks.landmark
             shoulder_z_diff = abs(plm[11].z - plm[12].z)
             facing = shoulder_z_diff < 0.15
             posture_score = 1.0 if facing else 0.4
-            
             ms_y = (plm[11].y + plm[12].y) / 2
             mh_y = (plm[23].y + plm[24].y) / 2
             spine_len = abs(mh_y - ms_y)
@@ -396,7 +325,6 @@ class VisionSystem:
         hand_res = self.mp_hands.process(rgb)
         gestures = []
         hand_bboxes = []
-        
         if hand_res.multi_hand_landmarks:
             for hand_lms in hand_res.multi_hand_landmarks:
                 g_list = self.gesture_engine.analyze(hand_lms, frame.shape)
@@ -407,10 +335,7 @@ class VisionSystem:
                 hx1, hy1, hx2, hy2 = min(xs)-pad, min(ys)-pad, max(xs)+pad, max(ys)+pad
                 hand_bboxes.append((hx1, hy1, hx2, hy2))
             
-            # Collision Logic
             with self.lock: yolo_boxes = self.context.get("_yolo_boxes", [])
-            touched_objects = set()
-
             for obj_name, ox1, oy1, ox2, oy2 in yolo_boxes:
                 if obj_name not in ALLOWED_CLASSES_FOR_HOLDING: continue
                 is_colliding = False
@@ -423,14 +348,10 @@ class VisionSystem:
                         if hand_area > 0 and (inter_area / hand_area) > IOU_THRESHOLD:
                             is_colliding = True
                             break
-                
                 if is_colliding:
-                    touched_objects.add(obj_name)
                     self.collision_counters[obj_name] = self.collision_counters.get(obj_name, 0) + 1
                     if self.collision_counters[obj_name] >= HOLDING_LATCH_FRAMES:
                         self.latched_objects.add(obj_name)
-                        cv2.rectangle(frame, (int(ox1), int(oy1)), (int(ox2), int(oy2)), (0, 255, 0), 2)
-                        cv2.putText(frame, f"HOLD: {obj_name}", (int(ox1), int(oy1)-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 else:
                     if obj_name in self.collision_counters:
                         self.collision_counters[obj_name] -= 1
@@ -441,55 +362,29 @@ class VisionSystem:
             self.collision_counters.clear()
             self.latched_objects.clear()
 
-        final_holding = [obj for obj in self.latched_objects if self.collision_counters.get(obj, 0) > 0]
         self.context["gestures"] = list(set(gestures))
-        self.context["holding"] = final_holding
+        self.context["holding"] = [obj for obj in self.latched_objects if self.collision_counters.get(obj, 0) > 0]
 
-        # --- 4. ATTENTION FUSION ---
-        attention = (gaze_score * 0.6) + (posture_score * 0.4)
+        # --- 4. ATTENTION ---
+        att_gaze = self.context["gaze"]["score"]
+        attention = (att_gaze * 0.6) + (posture_score * 0.4)
         engagement = (attention * 0.7) + (0.3 if len(gestures) > 0 else 0.0)
-        
         self.context["attention"] = float(round(np.clip(attention, 0, 1.0), 2))
         self.context["engagement"] = float(round(np.clip(engagement, 0, 1.0), 2))
         
-        self._current_metrics = {
-            'gaze': gaze_score,
-            'posture': posture_data,
-            'attention': attention
-        }
-
-        with self.lock: self.latest_frame = frame.copy()
+        self._current_metrics = {'gaze': att_gaze, 'posture': posture_data, 'attention': attention}
+        
+        with self.lock: 
+            self.latest_frame = frame.copy()
         return frame
 
     def get_context_json(self):
-        """Returns the current context as a JSON-compatible dictionary"""
-        return {
-            "identity": self.context["identity"],
-            "emotion": self.context["emotion"],
-            "emotion_intensity": self.context["emotion_intensity"],
-            "emotion_probs": self.context["emotion_probs"],
-            "state_confidence": self.context["state_confidence"],
-            "energy_level": self.context["energy_level"],
-            "attention": self.context["attention"],
-            "engagement": self.context["engagement"],
-            "gaze": self.context["gaze"],
-            "tracking": self.context["tracking"],
-            "posture": self.context["posture"],
-            "gestures": self.context["gestures"],
-            "holding": self.context["holding"],
-            "surroundings": self.context["surroundings"],
-            "timestamp": self.context["timestamp"],
-            "system_status": self.context["system_status"]
-        }
+        return {k: v for k, v in self.context.items() if not k.startswith('_')}
 
     def _yolo_worker(self):
-        """Dedicated YOLO Detection Thread"""
         while self.running:
-            if self.latest_frame is None: 
-                time.sleep(0.01); continue
-            
+            if self.latest_frame is None: time.sleep(0.01); continue
             with self.lock: frame = self.latest_frame.copy()
-
             try:
                 results = self.yolo(frame, verbose=False, conf=0.5)
                 boxes = []
@@ -505,62 +400,81 @@ class VisionSystem:
                 self.context["surroundings"] = list(surroundings)
                 self.context["_yolo_boxes"] = boxes
             except: pass
-
-            time.sleep(0.033)  # ~30 FPS
+            time.sleep(0.033)
 
     def _identity_worker(self):
-        """Dedicated Identity Recognition Thread"""
-        last_identity_check = 0
+        """
+        Compares live frame embedding against in-memory user embeddings.
+        No disk IO.
+        """
         while self.running:
             if self.latest_frame is None or self._current_landmarks is None:
                 time.sleep(0.05); continue
             
-            # Only run identity check every 2 seconds
-            if time.time() - last_identity_check < 2:
-                time.sleep(0.05); continue
-                
+            # If no user is logged in/loaded, we can't match
+            if not self.known_embeddings:
+                self.context["identity"] = "Stranger"
+                time.sleep(1.0)
+                continue
+
             with self.lock: frame = self.latest_frame.copy()
-            last_identity_check = time.time()
             
             try:
-                identities = DeepFace.find(frame, db_path="known_faces", enforce_detection=False, silent=True)
-                if identities and len(identities[0]) > 0:
-                    path = identities[0]['identity'][0]
-                    self.context["identity"] = os.path.basename(os.path.dirname(path))
-                else:
-                    self.context["identity"] = "Stranger"
-            except Exception: pass
+                # 1. Get embedding of current frame
+                current_emb_obj = DeepFace.represent(
+                    frame, 
+                    model_name="VGG-Face", 
+                    enforce_detection=False
+                )
+                
+                if not current_emb_obj:
+                    self.context["identity"] = "Unknown"
+                    time.sleep(0.1)
+                    continue
 
-            time.sleep(0.05)
+                curr_emb = current_emb_obj[0]["embedding"]
+                
+                # 2. Match against known memory
+                is_match = False
+                for auth_emb in self.known_embeddings:
+                    # Calculate Cosine Distance
+                    distance = dst.findCosineDistance(curr_emb, auth_emb)
+                    if distance < IDENTITY_THRESHOLD:
+                        is_match = True
+                        break
+                
+                self.context["identity"] = self.active_username if is_match else "Stranger"
+
+            except Exception: 
+                pass
+
+            time.sleep(0.1) # Check identity 10 times/sec
 
     def _emotion_worker(self):
-        """Dedicated Emotion Analysis Thread"""
         while self.running:
             if self.latest_frame is None or self._current_landmarks is None:
                 time.sleep(0.05); continue
-                
             with self.lock: frame = self.latest_frame.copy()
             metrics = getattr(self, '_current_metrics', {})
             landmarks = self._current_landmarks
-
             try:
                 analysis = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False, silent=True)
                 emo_res = self.emotion_engine.process(
-                    analysis, 
-                    metrics.get('gaze', 0.5), 
-                    metrics.get('posture', {}), 
-                    metrics.get('attention', 0.5),
-                    landmarks
+                    analysis, metrics.get('gaze', 0.5), metrics.get('posture', {}), 
+                    metrics.get('attention', 0.5), landmarks
                 )
-                
-                self.context["emotion"] = emo_res['dominant']
-                self.context["emotion_intensity"] = emo_res['intensity']
-                self.context["state_confidence"] = emo_res['confidence']
-                self.context["energy_level"] = emo_res['energy']
-                self.context["emotion_probs"] = emo_res['probabilities']
+                self.context.update({
+                    "emotion": emo_res['dominant'],
+                    "emotion_intensity": emo_res['intensity'],
+                    "state_confidence": emo_res['confidence'],
+                    "energy_level": emo_res['energy'],
+                    "emotion_probs": emo_res['probabilities']
+                })
             except Exception: pass
-
-            time.sleep(0.05)  # ~20 FPS for emotion
+            time.sleep(0.05)
 
     def stop(self):
         self.running = False
+        self.yolo_thread.join()
+        self.identity_thread.join()
+        self.emotion_thread.join()
